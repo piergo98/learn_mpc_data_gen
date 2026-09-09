@@ -1,9 +1,12 @@
-# Efficient Sampling — feasible initial-state sampling for MPC
+# Computationally Efficient Data Generation for Learning Nonlinear MPC Policies
 
-Code for the **sampling** contribution: how to draw initial states `x0` that
+<!-- Code for the **sampling** contribution: how to draw initial states `x0` that
 are *feasible* for a (possibly nonconvex, possibly discontinuous) MPC
 problem, and how the different strategies compare in cost, coverage, and
-rejection behaviour.
+rejection behaviour. -->
+The code provides an efficient procedure for generating feasible and locally optimal initial states 
+for learning NMPC policies.
+The strategy combines active-set exploration and projection-based sampling to generate feasible initial states that are distributed throughout the feasible set.
 
 The package is self-contained: `models/` and `src/` carry everything the
 experiments need, with no dependency on an external `ultro` package or other
