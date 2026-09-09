@@ -1,14 +1,13 @@
 # Sampling — feasible initial-state sampling for MPC
 
-Self-contained code for the **sampling** contribution: how to draw initial
-states `x0` that are *feasible* for a (possibly nonconvex, possibly
-discontinuous) MPC problem, and how the different strategies compare in cost,
-coverage, and rejection behaviour.
+Code for the **sampling** contribution: how to draw initial states `x0` that
+are *feasible* for a (possibly nonconvex, possibly discontinuous) MPC
+problem, and how the different strategies compare in cost, coverage, and
+rejection behaviour.
 
-This folder is **completely independent** from the rest of the repository. It
-carries its own copy of the models it needs and never imports from `../src`,
-`../models`, `../test`, or the installed `ultro` package. It can be copied out
-of this repository and it will keep working as-is.
+The package is self-contained: `models/` and `src/` carry everything the
+experiments need, with no dependency on an external `ultro` package or other
+repository.
 
 ---
 
@@ -41,10 +40,11 @@ Not every model implements every strategy — see the table in
 ## Layout
 
 ```
-sampling/
+.
 ├── README.md
+├── pyproject.toml
 ├── requirements.txt
-├── models/                 # dynamical systems + their samplers (self-contained)
+├── models/                 # dynamical systems + their samplers
 │   ├── cart_pole.py            -> CartPole
 │   ├── discontinuous_control.py-> DiscontinuousControl
 │   ├── linear.py               -> LinearSystem
@@ -61,20 +61,23 @@ sampling/
 └── results/                # experiment output (gitignored)
 ```
 
-Each script prepends this folder to `sys.path` at import time, so
-`from models.cart_pole import CartPole` resolves to `sampling/models/`, never to
-the copy at the repository root. Default output directories resolve to
-`sampling/results/`.
+Each script prepends the repository root to `sys.path` at import time, so
+`from models.cart_pole import CartPole` resolves to `models/` at the top of
+this repository regardless of the current working directory. Default output
+directories resolve to `results/`.
 
 ---
 
 ## Installation
 
 ```bash
-cd sampling
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
+
+This installs the pinned dependencies from `requirements.txt` together with
+the `models` and `src` packages. For an editable checkout during development,
+use `pip install -e .` instead.
 
 `torch` is only imported by `sampling_strategy_supervised_comparison.py`; every
 other script runs without it.
@@ -104,7 +107,7 @@ Everything that does not use the bilevel sampler runs on the stock wheel.
 
 ## Running the experiments
 
-All commands are run **from this `sampling/` directory**. Every script takes
+All commands are run **from the repository root**. Every script takes
 `--help`, `--seed`, and `--output-dir`, and writes a CSV/JSON summary plus PNG
 and PDF figures. `--show` opens the figures instead of only saving them.
 
@@ -262,12 +265,10 @@ model.plot_feasible_set(...)                      # 2-D feasible-set diagnostics
 
 ## Using a model directly
 
+After `pip install .` (or `pip install -e .`), `models` and `src` are regular
+importable packages — no `sys.path` manipulation needed:
+
 ```python
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path("sampling").resolve()))   # or run from sampling/
-
 from models.discontinuous_control import DiscontinuousControl
 
 model = DiscontinuousControl(N=10)
@@ -291,13 +292,11 @@ hr = model.collect_feasible_samples_with_hit_and_run(
 
 ---
 
-## Relationship to the rest of the repository
+## Provenance
 
-The repository root holds the **MPC-approximation** contribution (learning a
-neural network policy inside the optimization problem). That code has its own
-copies of `models/` and `src/`; the two trees share no imports and no output
-directories, so they can be developed, run, and released independently. The
-model files here were copied verbatim from the root, and
-`src/linear_defaults.py` holds the six default linear-MPC matrices that the
-supervised experiment previously imported from
+This repository was extracted from a larger project that also contains an
+**MPC-approximation** contribution (learning a neural network policy inside
+the optimization problem). The models here were copied verbatim from that
+project, and `src/linear_defaults.py` holds the six default linear-MPC
+matrices that the supervised experiment previously imported from
 `src/linear_training_strategy_comparison.py`.
