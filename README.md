@@ -1,4 +1,4 @@
-# Sampling — feasible initial-state sampling for MPC
+# Efficient Sampling — feasible initial-state sampling for MPC
 
 Code for the **sampling** contribution: how to draw initial states `x0` that
 are *feasible* for a (possibly nonconvex, possibly discontinuous) MPC
