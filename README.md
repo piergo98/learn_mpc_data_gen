@@ -8,9 +8,9 @@ The code provides an efficient procedure for generating feasible and locally opt
 for learning NMPC policies.
 The strategy combines active-set exploration and projection-based sampling to generate feasible initial states that are distributed throughout the feasible set.
 
-The package is self-contained: `models/` and `src/` carry everything the
-experiments need, with no dependency on an external `ultro` package or other
-repository.
+The package is self-contained: 
+`models/` contains the models to which the procedure has been applied
+`src/` carry all the scripts for making all the comparisons between different combinations of the proposed methods
 
 ---
 
