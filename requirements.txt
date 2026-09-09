@@ -1,0 +1,15 @@
+# Runtime dependencies of the sampling experiments.
+#
+# CasADi must be a build that exposes the solver plugins used by the models:
+#   * ipopt    -- nonlinear MPC, seed problems, slacked/projection problems
+#   * qpoases  -- linear programs of the linearized Hit-and-Run chain
+#   * ccopt    -- complementarity relaxation used by the bilevel active-set sampler
+# The stock PyPI wheel ships ipopt and qpoases but NOT ccopt, so the bilevel
+# samplers need the custom CasADi build (see README, "CasADi and solver plugins").
+casadi==3.7.2
+numpy>=1.20.0
+scipy>=1.7.0
+matplotlib>=3.3.0
+
+# Only needed by src/sampling_strategy_supervised_comparison.py
+torch>=2.0.0
