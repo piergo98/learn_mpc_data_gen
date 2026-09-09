@@ -291,12 +291,3 @@ hr = model.collect_feasible_samples_with_hit_and_run(
 ```
 
 ---
-
-## Provenance
-
-This repository was extracted from a larger project that also contains an
-**MPC-approximation** contribution (learning a neural network policy inside
-the optimization problem). The models here were copied verbatim from that
-project, and `src/linear_defaults.py` holds the six default linear-MPC
-matrices that the supervised experiment previously imported from
-`src/linear_training_strategy_comparison.py`.
