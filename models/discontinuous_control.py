@@ -1,3 +1,4 @@
+import time
 import warnings
 
 import casadi as ca
@@ -6,6 +7,17 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Rectangle
 from scipy.linalg import null_space
+
+try:
+    from .scholtes_homotopy import ScholtesHomotopySolver
+except ImportError:  # Support running this file directly from the repository.
+    from scholtes_homotopy import ScholtesHomotopySolver
+
+
+# Shared tolerance for transferring numerically active NLP bounds and
+# equalities into the condensed Hit-and-Run LP.
+BOUNDARY_LP_FEASIBILITY_TOL = 1e-7
+
 
 # Class implementing a model with discontinuous control law
 class DiscontinuousControl:
@@ -198,6 +210,15 @@ class DiscontinuousControl:
                 self.control_bound + u_nominal,
             )
         F_input = np.zeros((2 * self.N, 2))
+        min_nominal_margin = float(np.min(b_input))
+        if min_nominal_margin < -BOUNDARY_LP_FEASIBILITY_TOL:
+            raise RuntimeError(
+                "The nominal controls are not feasible for the linearized "
+                f"OCP: minimum input margin is {min_nominal_margin:.3e}."
+            )
+        # Preserve feasibility at active bounds when the reference NLP is only
+        # outside by solver-scale numerical noise.
+        b_input = np.maximum(b_input, 0.0)
 
         # This linearized OCP has the following structure:
         # M du = -dx0
@@ -216,6 +237,7 @@ class DiscontinuousControl:
         dx0,
         direction,
         linear_ocp,
+        initial_state_bounds,
     ):
         """Return the largest feasible nonnegative step along ``direction``.
 
@@ -230,11 +252,15 @@ class DiscontinuousControl:
         Here ``dx0`` is the current perturbation ``dx0_j`` relative to the
         nominal state used to construct ``linear_ocp``.  
 
-        The LP is solved through CasADi's ``conic`` interface with qpOASES.
+        The LP is solved through CasADi's ``conic`` interface, with the
+        "nlpsol" plugin casting it to an NLP handed to IPOPT.
         """
         G = np.asarray(linear_ocp["G"], dtype=float)
         b = np.asarray(linear_ocp["b"], dtype=float).reshape(-1)
         M = np.asarray(linear_ocp["M"], dtype=float)
+        initial_state_bounds = np.asarray(
+            initial_state_bounds, dtype=float
+        ).reshape(-1)
 
         if G.ndim != 2:
             raise ValueError("linear_ocp['G'] must be a matrix.")
@@ -258,9 +284,13 @@ class DiscontinuousControl:
             raise ValueError(
                 f"direction must have shape {dx0.shape}; got {direction.shape}."
             )
+        if initial_state_bounds.shape != dx0.shape:
+            raise ValueError(
+                "initial_state_bounds must match the initial-state dimension."
+            )
         if not all(
             np.all(np.isfinite(value))
-            for value in (G, b, M, dx0, direction)
+            for value in (G, b, M, dx0, direction, initial_state_bounds)
         ):
             raise ValueError("The boundary LP data must contain only finite values.")
 
@@ -269,18 +299,45 @@ class DiscontinuousControl:
         big_M = np.column_stack((M, direction))
         # Create the A matrix for the inequality constraints: A = [M, direction; G, 0]
         A = np.vstack((big_M, np.column_stack((G, np.zeros(n_constraints)))))
-        lba = np.hstack([-dx0, -np.inf * np.ones(n_constraints)])
-        uba = np.hstack([-dx0, b])
+        lba = np.hstack([
+            -dx0 - BOUNDARY_LP_FEASIBILITY_TOL,
+            -np.inf * np.ones(n_constraints),
+        ])
+        uba = np.hstack([
+            -dx0 + BOUNDARY_LP_FEASIBILITY_TOL,
+            b + BOUNDARY_LP_FEASIBILITY_TOL,
+        ])
+
+        # The original MPC constrains x0, and the comparison may request a
+        # tighter sampling box. Include those (already linear) inequalities in
+        # the bounded local feasible set traversed by Hit-and-Run.
+        seed = np.asarray(linear_ocp["x0_nominal"], dtype=float).reshape(-1)
+        zero_controls = np.zeros((dx0.size, n_du))
+        initial_state_A = np.vstack(
+            (
+                np.column_stack((zero_controls, direction)),
+                np.column_stack((zero_controls, -direction)),
+            )
+        )
+        initial_state_uba = np.hstack(
+            (
+                initial_state_bounds - seed - dx0,
+                initial_state_bounds + seed + dx0,
+            )
+        ) + BOUNDARY_LP_FEASIBILITY_TOL
+        A = np.vstack((A, initial_state_A))
+        lba = np.hstack((lba, np.full(2 * dx0.size, -np.inf)))
+        uba = np.hstack((uba, initial_state_uba))
         # The decision vector is [du, alpha], so the number of variables is n_du + 1.
         n_variables = n_du + 1
         n_equalities = big_M.shape[0]
-        n_rows = n_equalities + n_constraints
+        n_rows = A.shape[0]
 
         cache = getattr(self, "_linearized_boundary_conic_cache", None)
         if cache is None:
             cache = {}
             self._linearized_boundary_conic_cache = cache
-        cache_key = (n_constraints, n_variables)
+        cache_key = (n_rows, n_variables)
         solver = cache.get(cache_key)
         if solver is None:
             # The LP structure is defined below.
@@ -292,16 +349,32 @@ class DiscontinuousControl:
                 "a": ca.Sparsity.dense(n_rows, n_variables),
             }
             options = {
-                "printLevel": "none",
                 "print_time": False,
                 "error_on_fail": False,
+                # Solve the LP through IPOPT rather than qpOASES: the "nlpsol"
+                # conic plugin casts the QP/LP as a (trivial) NLP and hands it
+                # to the named nlpsol solver.
+                "nlpsol": "ipopt",
+                "nlpsol_options": {
+                    "print_time": False,
+                    "ipopt.print_level": 0,
+                    "ipopt.hessian_constant": "yes",
+                    "ipopt.least_square_init_primal": "yes",
+                    "ipopt.least_square_init_duals": "yes",
+                    "ipopt.mehrotra_algorithm": "yes",
+                },
+                # "nlpsol": "qpoases",
+                # "nlpsol_options": {
+                #     "print_time": False,
+                #     "qpoases.printLevel": "none",
+                # },
             }
             solver = ca.conic(
                 (
                     f"linearized_boundary_{id(self)}_"
-                    f"{n_constraints}_{n_variables}"
+                    f"{n_rows}_{n_variables}"
                 ),
-                "qpoases",
+                "nlpsol",
                 lp_structure,
                 options,
             )
@@ -334,8 +407,12 @@ class DiscontinuousControl:
         alpha = float(solution[-1])
         if not np.isfinite(alpha):
             return None
-
-        return alpha
+        # IPOPT can violate the alpha >= 0 bound by a small feasibility
+        # tolerance. Clamp only that numerical residue; a material violation
+        # means this direction is not a valid Hit-and-Run chord.
+        if alpha < -1e-8:
+            return None
+        return max(alpha, 0.0)
 
     @staticmethod
     def _validate_projection_weight(Qx):
@@ -626,19 +703,27 @@ class DiscontinuousControl:
         # burn_in=10,
         # thinning=1,
         projection_Qx=None,
+        reference_method="uniform",
+        slack_penalty="quadratic",
+        close_to_bounds=True,
         random_seed=None,
         x_max=None,
         plot_results=True,
         show=True,
+        warm_start=True,
     ):
         """Sample the feasible set with local linearized Hit-and-Run.
 
-        A fixed linearized OCP is constructed around every nonlinear-feasible
-        seed.  Each chain evolves in ``dx0`` coordinates relative to that seed.
-        Every retained linearized proposal is checked against the original
-        nonlinear MPC. Feasible proposals are accepted directly; only
-        infeasible proposals are mapped through the nonlinear projection
-        problem from equation (6).
+        A fixed linearized OCP is constructed around every reference solution
+        selected by ``reference_method``. Each chain generates exactly
+        ``num_samples / num_feasible_seeds`` bounded linearized candidates in
+        ``dx0`` coordinates. Every candidate is used as the target of the
+        nonlinear projection problem; its solution supplies the returned
+        feasible state and locally optimal NMPC trajectory.
+
+        When ``warm_start`` is enabled, consecutive bilevel solves reuse the
+        previous successful solution and each chain reuses its latest
+        projected trajectory.
         """
         if num_samples < 0:
             raise ValueError("num_samples must be non-negative.")
@@ -672,14 +757,53 @@ class DiscontinuousControl:
                 "returned_samples": 0,
             }
             return np.empty((0, 2))
+        if num_feasible_seeds > num_samples:
+            raise ValueError("num_feasible_seeds cannot exceed num_samples.")
 
-        # Generate feasible seeds by sampling the state space and solving the MPC problem
+        reference_method = str(reference_method).lower()
+        if reference_method not in {"uniform", "bilevel", "slacked"}:
+            raise ValueError(
+                "reference_method must be 'uniform', 'bilevel', or 'slacked'."
+            )
+
+        # Generate the reference solutions used to build the local linearized OCPs.
         rng = np.random.default_rng(random_seed)
         seeds = []
         seed_solutions = []
         seed_attempts = 0
-        target_seed_count = min(num_feasible_seeds, num_samples)
-        while (len(seeds) < target_seed_count and seed_attempts < max_seed_attempts):
+        target_seed_count = num_feasible_seeds
+        if num_samples % target_seed_count != 0:
+            raise ValueError(
+                "num_samples must be divisible by num_feasible_seeds so each "
+                "reference produces the same number M of candidates."
+            )
+        samples_per_reference = num_samples // target_seed_count
+        reference_stats = {}
+        reference_start = time.perf_counter()
+        if reference_method == "bilevel":
+            seeds, seed_solutions = self.collect_feasible_samples_with_bilevel(
+                x_max=state_bounds,
+                num_samples=target_seed_count,
+                max_attempts=max_seed_attempts,
+                plot_results=False,
+                return_solutions=True,
+                warm_start=warm_start,
+            )
+            seed_attempts = int(self.last_feasible_sampling_stats["attempts"])
+            reference_stats = dict(self.last_feasible_sampling_stats)
+        elif reference_method == "slacked":
+            seeds, seed_solutions = self.collect_feasible_samples_with_slacked(
+                x_max=state_bounds,
+                close_to_bounds=close_to_bounds,
+                num_samples=target_seed_count,
+                max_attempts=max_seed_attempts,
+                plot_results=False,
+                slack_penalty=slack_penalty,
+                return_solutions=True,
+            )
+            seed_attempts = int(self.last_feasible_sampling_stats["attempts"])
+            reference_stats = dict(self.last_feasible_sampling_stats)
+        while reference_method == "uniform" and len(seeds) < target_seed_count and seed_attempts < max_seed_attempts:
             seed_attempts += 1
             candidate = rng.uniform(-state_bounds, state_bounds)
             try:
@@ -710,20 +834,38 @@ class DiscontinuousControl:
                 # Store the feasible seed and its corresponding optimal solution
                 seeds.append(solved_x0)
                 seed_solutions.append(solution)
-        if not seeds:
+        reference_time_s = time.perf_counter() - reference_start
+        if len(seeds) != target_seed_count:
             raise RuntimeError(
-                f"No feasible seed found after {max_seed_attempts} attempts."
+                f"Collected {len(seeds)}/{target_seed_count} required "
+                f"{reference_method} reference solutions."
             )
 
         chains = []
-        for seed, solution in zip(seeds, seed_solutions):
+        for reference_index, (seed, solution) in enumerate(
+            zip(seeds, seed_solutions)
+        ):
+            linear_ocp = self._linearized_opc_at_solution(solution)
+            box_margin = float(np.min(state_bounds - np.abs(seed)))
+            ocp_margin = float(np.min(linear_ocp["b"]))
+            if box_margin < -BOUNDARY_LP_FEASIBILITY_TOL:
+                raise RuntimeError(
+                    f"Reference {reference_index} is outside the Hit-and-Run "
+                    f"initial-state box by {-box_margin:.3e}."
+                )
             chains.append(
                 {
+                    "reference_index": reference_index,
                     "seed": seed.copy(),
                     "seed_solution": solution,
                     "delta_x": np.zeros(2),
-                    "linear_ocp": self._linearized_opc_at_solution(solution),
+                    "linear_ocp": linear_ocp,
+                    "origin_box_margin": box_margin,
+                    "origin_ocp_margin": ocp_margin,
                     "steps": 0,
+                    "generated": 0,
+                    "boundary_lp_failures": 0,
+                    "projection_solution": solution,
                 }
             )
 
@@ -731,18 +873,22 @@ class DiscontinuousControl:
         controls = []
         raw_candidates = []
         accepted_raw_candidates = []
-        raw_candidate_needed_projection = []
         projection_needed = 0
         projection_failures = 0
         boundary_lp_failures = 0
         chain_updates = 0
         chain_index = 0
         max_chain_updates = 10 * num_samples
+        candidates_generated = 0
+        boundary_lp_time_s = 0.0
+        projection_time_s = 0.0
 
-        while (len(samples) < num_samples and chain_updates < max_chain_updates):
+        while candidates_generated < num_samples and chain_updates < max_chain_updates:
             # Select the next chain in a round-robin fashion
             chain = chains[chain_index % len(chains)]
             chain_index += 1
+            if chain["generated"] >= samples_per_reference:
+                continue
             # Generate a random direction in the 2D state space
             direction = rng.normal(size=2)
             direction_norm = np.linalg.norm(direction)
@@ -750,71 +896,92 @@ class DiscontinuousControl:
                 continue
             direction /= direction_norm
             # Compute the maximum feasible step sizes in both directions along the random direction
+            lp_start = time.perf_counter()
             alpha_plus = self._linearized_boundary_step(
                 chain["delta_x"],
                 direction,
                 chain["linear_ocp"],
+                state_bounds,
             )
             alpha_minus = self._linearized_boundary_step(
                 chain["delta_x"],
                 -direction,
                 chain["linear_ocp"],
+                state_bounds,
             )
+            boundary_lp_time_s += time.perf_counter() - lp_start
             chain_updates += 1
             if alpha_plus is None or alpha_minus is None:
                 boundary_lp_failures += 1
-                if alpha_plus is None:
-                    print(f"Boundary LP failed for positive direction: {direction}")
-                if alpha_minus is None:
-                    print(f"Boundary LP failed for negative direction: {direction}")
+                chain["boundary_lp_failures"] += 1
+                at_origin = np.linalg.norm(
+                    chain["delta_x"], ord=np.inf
+                ) <= BOUNDARY_LP_FEASIBILITY_TOL
+                if at_origin:
+                    raise RuntimeError(
+                        "Boundary LP failed at the guaranteed-feasible origin "
+                        f"of reference {chain['reference_index']}; "
+                        f"box margin={chain['origin_box_margin']:.3e}, "
+                        f"OCP margin={chain['origin_ocp_margin']:.3e}. "
+                        "This indicates a solver/interface failure rather than "
+                        "a failed Hit-and-Run direction."
+                    )
+                chain["delta_x"] = np.zeros(2)
                 continue
-            # Sample a step size uniformly from the feasible range and update the chain's state
-            beta = rng.uniform(-alpha_minus, alpha_plus)
+            if alpha_plus < 0.0 or alpha_minus < 0.0:
+                # Defensive guard against a solver returning an invalid chord.
+                boundary_lp_failures += 1
+                chain["delta_x"] = np.zeros(2)
+                continue
+            # Stay infinitesimally inside the chord. This prevents accumulated
+            # LP feasibility tolerances from moving the next chain state just
+            # outside its local polytope.
+            chord_width = alpha_plus + alpha_minus
+            # Stay farther inside than the LP feasibility tolerance; 1e-10 was
+            # too small to prevent numerical infeasibility at the next step.
+            margin = min(
+                10.0 * BOUNDARY_LP_FEASIBILITY_TOL,
+                0.25 * chord_width,
+            )
+            beta = rng.uniform(-alpha_minus + margin, alpha_plus - margin)
             chain["delta_x"] += beta * direction
             chain["steps"] += 1
             # # Only retain samples after the burn-in period and according to the thinning parameter
             # if (chain["steps"] <= burn_in or (chain["steps"] - burn_in - 1) % thinning != 0):
             #     continue
-            # Compute the candidate state by adding the perturbation to the seed, then project it onto the feasible set
+            # Compute the candidate state by adding the perturbation to the
+            # reference, then always use it as the nonlinear projection target.
             candidate = chain["seed"] + chain["delta_x"]
             raw_candidates.append(candidate.copy())
-            # The linearized OCP only guarantees local linearized feasibility.
-            # Classify the raw state against the original nonlinear MPC before
-            # projection so sampling comparisons can report how often the
-            # linearization itself produced a state requiring correction.
-            # candidate_solution = self._feasible_mpc_solution(candidate)
-            # needs_projection = candidate_solution is None
-            
-            # raw_candidate_needed_projection.append(needs_projection)
-            # projection_needed += int(needs_projection)
-            # if not needs_projection:
-            #     _, candidate_U = self.extract_traj(candidate_solution["x"])
-            #     samples.append(candidate.copy())
-            #     controls.append(float(candidate_U[0]))
-            #     accepted_raw_candidates.append(candidate.copy())
-            #     continue
-            # print(f"Candidate before projection: {candidate}")
-            # continue
+            chain["generated"] += 1
+            candidates_generated += 1
+            projection_start = time.perf_counter()
             try:
                 projected, projection_solution = self.project_onto_feasible_set(
                     candidate,
                     Qx=Qx,
                     feasible_reference=chain["seed"],
-                    reference_solution=chain["seed_solution"],
+                    reference_solution=(
+                        chain["projection_solution"]
+                        if warm_start else chain["seed_solution"]
+                    ),
                     return_solution=True,
                 )
             except RuntimeError:
+                projection_time_s += time.perf_counter() - projection_start
                 projection_failures += 1
                 continue
-            # Check if projection was needed a posteriori
-            # TODO: IMPROVE THIS TEST
+            projection_time_s += time.perf_counter() - projection_start
+            # Record whether the projection changed the target.
             projected_was_needed = not np.allclose(projected, candidate, atol=1e-6, rtol=0.0)
             if projected_was_needed:
                 projection_needed += 1
             _, projected_U = self.extract_traj(projection_solution["x"])
             samples.append(projected)
+            if warm_start:
+                chain["projection_solution"] = projection_solution
             controls.append(float(projected_U[0]))
-            # accepted_raw_candidates.append(candidate.copy())
+            accepted_raw_candidates.append(candidate.copy())
 
         result = np.asarray(samples, dtype=float).reshape(-1, 2)
         self.last_feasible_sample_controls = np.asarray(controls, dtype=float)
@@ -824,20 +991,38 @@ class DiscontinuousControl:
             "seed_attempts": int(seed_attempts),
             "feasible_seeds": np.asarray(seeds, dtype=float).reshape(-1, 2),
             "raw_candidates": np.asarray(raw_candidates, dtype=float).reshape(-1, 2),
-            # "accepted_raw_candidates": np.asarray(accepted_raw_candidates, dtype=float).reshape(-1, 2),
-            # "raw_candidate_needed_projection": np.asarray(raw_candidate_needed_projection, dtype=bool),
+            "accepted_raw_candidates": np.asarray(
+                accepted_raw_candidates, dtype=float
+            ).reshape(-1, 2),
             "projection_needed": int(projection_needed),
             "projection_failures": int(projection_failures),
+            "warm_start": bool(warm_start),
             "boundary_lp_failures": int(boundary_lp_failures),
+            "boundary_lp_failures_per_reference": np.asarray(
+                [chain["boundary_lp_failures"] for chain in chains],
+                dtype=int,
+            ),
             "chain_updates": int(chain_updates),
             # "burn_in": int(burn_in),
             # "thinning": int(thinning),
             "projection_Qx": Qx.copy(),
+            "reference_method": reference_method,
+            "reference_statistics": reference_stats,
+            "samples_per_reference": int(samples_per_reference),
+            "reference_time_s": float(reference_time_s),
+            "boundary_lp_time_s": float(boundary_lp_time_s),
+            "projection_time_s": float(projection_time_s),
         }
+        if candidates_generated < num_samples:
+            raise RuntimeError(
+                f"Generated only {candidates_generated}/{num_samples} candidates "
+                f"after {chain_updates} Hit-and-Run updates. Inspect "
+                "last_linearized_sampling_stats for diagnostics."
+            )
         if result.shape[0] < num_samples:
             raise RuntimeError(
-                f"Collected only {result.shape[0]}/{num_samples} samples "
-                f"after {chain_updates} Hit-and-Run updates. Inspect "
+                f"Projected only {result.shape[0]}/{num_samples} candidates; "
+                "the Np*M projection pipeline is incomplete. Inspect "
                 "last_linearized_sampling_stats for diagnostics."
             )
         if plot_results:
@@ -853,14 +1038,32 @@ class DiscontinuousControl:
             )
         return result
 
-    def bilevel_active_set(self, x_max, slack_penalty='quadratic', return_solver=False):
+    def bilevel_active_set(
+        self,
+        x_max,
+        slack_penalty='quadratic',
+        return_solver=False,
+        complementarity_method="ccopt",
+        scholtes_relaxations=(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6),
+    ):
         """
         Bilevel active-set method for finding a feasible initial state for the MPC problem.
-        By construction, the returned state is guaranteed to be optimally feasible for the MPC problem.
+
+        ``complementarity_method`` selects either the native ``"ccopt"``
+        complementarity solver or a ``"scholtes"`` relaxation homotopy solved
+        with IPOPT.  ``scholtes_relaxations`` must be a strictly decreasing
+        sequence of positive relaxation parameters.
         """
         slack_penalty = str(slack_penalty).lower()
         if slack_penalty not in {"l1", "quadratic"}:
             raise ValueError("slack_penalty must be either 'l1' or 'quadratic'.")
+        complementarity_method = str(complementarity_method).lower().replace("-", "_")
+        if complementarity_method == "scholtes_ipopt":
+            complementarity_method = "scholtes"
+        if complementarity_method not in {"ccopt", "scholtes"}:
+            raise ValueError(
+                "complementarity_method must be either 'ccopt' or 'scholtes'."
+            )
 
         def weighted_slack_cost(slacks, weights):
             regularization = 1e-6 * ca.dot(slacks, slacks)
@@ -959,7 +1162,7 @@ class DiscontinuousControl:
                 min_spikes=1,
                 max_spikes=1,
                 base_scale=1e-6,
-                spike_factor_range=(1e6, 1e8),
+                spike_factor_range=(1e0, 1e2),
                 spike_probability=0.6,
             )
         if return_solver:
@@ -991,12 +1194,12 @@ class DiscontinuousControl:
         lbg += [0.0] * stationarity.shape[0]
         ubg += [0.0] * stationarity.shape[0]
         
-        # Create the NLP problem
+        # Parameters exposed to callers.  The Scholtes relaxation parameter is
+        # appended privately by ScholtesHomotopySolver below.
         if return_solver:
-            params = ca.vertcat(x0, rho_param)
-            nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': params}
+            user_params = ca.vertcat(x0, rho_param)
         else:
-            nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p':x0}
+            user_params = x0
             
         varvar = 0
 
@@ -1004,32 +1207,64 @@ class DiscontinuousControl:
             print(f"len(slack_indices) = {len(slack_indices)}, lam_g.numel() = {lam_g.numel()}")
             raise RuntimeError("One residual is required per inequality multiplier.")
 
-        ind_cc = [
-            [lam_g_start + i, slack_indices[i]]
-            for i in range(lam_g.numel())
-        ]
-        cctypes = [varvar] * lam_g.numel()
-        
         # Create the NLP solver
-        print("Creating NLP solver...")
-        opts = {
-            "expand": False,
-            "print_time": False,
-            # ccopt delegates NLP solves to MadNLP; bound_relax_factor=0.0 is
-            # important for complementarity formulations.
-            "cc_pairs": ind_cc,
-            "cc_types": cctypes,
-            "madnlp.print_level": 6,
-            "madnlp.max_iter": 5000,
-            "madnlp.tol": 1e-6,
-            "madnlp.bound_relax_factor": 0.0,
-            "madnlp.linear_solver": "Ma97Solver",
-            "ccopt.relaxation_update.TYPE": "RolloffRelaxationUpdate",
-            "ccopt.relaxation_update.rolloff_point": 1e-3,
-            "ccopt.relaxation_update.rolloff_slope": 1.5,
-            "ccopt.relaxation_update.sigma_min": 1e-6,
-        }
-        bilevel_solver = ca.nlpsol("bilevel_solver", "ccopt", nlp, opts)
+        print(f"Creating {complementarity_method} bilevel NLP solver...")
+        if complementarity_method == "ccopt":
+            ind_cc = [
+                [lam_g_start + i, slack_indices[i]]
+                for i in range(lam_g.numel())
+            ]
+            cctypes = [varvar] * lam_g.numel()
+            nlp = {
+                'f': J,
+                'x': ca.vertcat(*w),
+                'g': ca.vertcat(*g),
+                'p': user_params,
+            }
+            opts = {
+                "expand": False,
+                "print_time": False,
+                # ccopt delegates NLP solves to MadNLP; bound_relax_factor=0.0 is
+                # important for complementarity formulations.
+                "cc_pairs": ind_cc,
+                "cc_types": cctypes,
+                "madnlp.print_level": 6,
+                "madnlp.max_iter": 2000,
+                "madnlp.tol": 1e-6,
+                "madnlp.bound_relax_factor": 0.0,
+                "madnlp.linear_solver": "Ma97Solver",
+                "ccopt.relaxation_update.TYPE": "RolloffRelaxationUpdate",
+                "ccopt.relaxation_update.rolloff_point": 1e-3,
+                "ccopt.relaxation_update.rolloff_slope": 1.5,
+                "ccopt.relaxation_update.sigma_min": 1e-6,
+            }
+            bilevel_solver = ca.nlpsol("bilevel_solver", "ccopt", nlp, opts)
+        else:
+            relaxation = ca.SX.sym("scholtes_relaxation")
+            complementarity_products = lam_g * ca.vertcat(*slacks)
+            g += [complementarity_products - relaxation]
+            lbg += [-ca.inf] * lam_g.numel()
+            ubg += [0.0] * lam_g.numel()
+            nlp = {
+                'f': J,
+                'x': ca.vertcat(*w),
+                'g': ca.vertcat(*g),
+                'p': ca.vertcat(user_params, relaxation),
+            }
+            opts = {
+                "expand": False,
+                "print_time": False,
+                "ipopt.print_level": 0,
+                "ipopt.max_iter": 5000,
+                "ipopt.tol": 1e-8,
+                "ipopt.acceptable_tol": 1e-6,
+            }
+            ipopt_solver = ca.nlpsol(
+                "bilevel_scholtes_solver", "ipopt", nlp, opts
+            )
+            bilevel_solver = ScholtesHomotopySolver(
+                ipopt_solver, user_params.numel(), scholtes_relaxations
+            )
         
         mpc_vars = ca.Function('mpc_vars', [ca.vertcat(*w)], [ca.vertcat(*w_mpc)])
         lambda_vars = ca.Function('lambda_vars', [ca.vertcat(*w)], [lam_h, lam_g])
@@ -1119,16 +1354,17 @@ class DiscontinuousControl:
         plot_results=False,
         return_u_seq=False,
         slack_penalty="quadratic",
-        print_constraint_jacobian=False,
+        print_stationarity_perturbation=False,
         return_traj=False,
     ):
-        """Find an initial state that yields a feasible optimal solution for the MPC problem.
+        """Find a feasible initial state with the paper's slacked auxiliary NLP.
 
-        The auxiliary NLP replicates the MPC problem (dynamics, input bounds,
-        state bounds and the terminal constraint ``x_N = 0``) while replacing
-        every bound by a residual slack. Randomly spiked slack weights then pull
-        a single bound residual to zero, so repeated calls return different
-        states on the boundary of the feasible set.
+        The auxiliary NLP replicates the MPC objective and constraints after
+        dropping the equation that fixes x0. Every original inequality is
+        represented as ``g(w) + s = 0``, ``s >= 0``. Sampled positive diagonal
+        entries of Q steer selected residuals toward zero. The trajectory is
+        generally stationary for the perturbed objective characterized in the
+        paper, not necessarily for the original MPC objective.
 
         Parameters
         ----------
@@ -1138,11 +1374,12 @@ class DiscontinuousControl:
             Maximum absolute values for the state components. If None, defaults
             to the state bounds used by the MPC problem.
         close_to_bounds : bool, optional
-            If True, the state residuals are exact (equality) residuals, so the
-            spiked weight drives one state to its bound. If False, the residuals
-            only over-estimate the distance to the bounds.
+            If True, both state and input inequalities may receive positive
+            sampled activity weights. If False, only input inequalities are
+            targeted. All residual equations remain exact in either case.
         u0_active_bound : bool, optional
-            Kept for signature compatibility with the other models; unused.
+            If True, one side of the first-input bound is always included in
+            the sampled target set (it is penalized, not imposed as an equality).
         plot_results : bool, optional
             If True, plots the resulting trajectory.
         return_u_seq : bool, optional
@@ -1150,37 +1387,45 @@ class DiscontinuousControl:
         return_traj : bool, optional
             If True, returns the solution vector laid out like the MPC decision
             vector ``[x0, u_0, ..., u_{N-1}]`` (usable as a warm start).
-        slack_penalty : {"l1", "quadratic"}, optional
-            Norm used for the randomly weighted state and input residual slacks.
-        print_constraint_jacobian : bool, optional
+        slack_penalty : {"quadratic"}, optional
+            Kept as an explicit argument for API compatibility. The paper's
+            objective is exactly ``0.5 * s.T @ Q @ s``; L1 is rejected.
+        print_stationarity_perturbation : bool, optional
             If True, checks (and prints) whether the returned state is also
             optimal for the MPC problem via the slack stationarity condition.
         """
         slack_penalty = str(slack_penalty).lower()
-        if slack_penalty not in {"l1", "quadratic"}:
-            raise ValueError("slack_penalty must be either 'l1' or 'quadratic'.")
+        if slack_penalty != "quadratic":
+            raise ValueError(
+                "The paper-compliant slacked formulation only supports "
+                "slack_penalty='quadratic'."
+            )
 
         def weighted_slack_cost(slacks, weights):
-            regularization = 1e-6 * ca.dot(slacks, slacks)
-            if slack_penalty == "l1":
-                return ca.dot(ca.DM(weights), slacks)
-            return slacks.T @ np.diag(weights) @ slacks
+            # Exactly 1/2 ||s||_Q^2, so its slack gradient is Qs as in the
+            # derivation in the paper (with no unreported regularizer).
+            return 0.5 * ca.dot(ca.DM(weights), slacks**2)
 
         if N is None:
             N = self.N
         if N < 1:
             raise ValueError("N must be at least 1.")
 
+        state_bounds = np.asarray(
+            getattr(self, "state_bound", np.array([4.0, 4.0])), dtype=float
+        )
         if x_max is None:
-            x_max = np.asarray(getattr(self, "state_bound", np.array([4.0, 4.0])), dtype=float)
+            x_max = state_bounds.copy()
         else:
             x_max = np.asarray(x_max, dtype=float)
             if x_max.shape != (2,):
                 raise ValueError("x_max must have shape (2,).")
             if np.any(~np.isfinite(x_max)) or np.any(x_max <= 0.0):
                 raise ValueError("x_max must contain positive finite values.")
+            if np.any(x_max > state_bounds + 1e-12):
+                raise ValueError("x_max cannot exceed the original MPC state bounds.")
 
-        x_min = -x_max
+        state_min = -state_bounds
         u_max = np.array([self.control_bound], dtype=float)
         u_min = -u_max
 
@@ -1216,14 +1461,13 @@ class DiscontinuousControl:
         ubw += [ca.inf for _ in range(4)]
         w0 += [0.0 for _ in range(4)]
 
-        if close_to_bounds:
-            constraints += [Xk - x_max + s_x0[:, 0], -Xk + x_min + s_x0[:, 1]]
-            lbg += [0.0 for _ in range(4)]
-            ubg += [0.0 for _ in range(4)]
-        else:
-            constraints += [Xk - x_max + s_x0[:, 0], -Xk + x_min + s_x0[:, 1]]
-            lbg += [-ca.inf for _ in range(4)]
-            ubg += [0.0 for _ in range(4)]
+        constraints += [
+            Xk - state_bounds + s_x0[:, 0],
+            -Xk + state_min + s_x0[:, 1],
+        ]
+        # The paper requires g(w) + s = 0 for every inequality residual.
+        lbg += [0.0 for _ in range(4)]
+        ubg += [0.0 for _ in range(4)]
 
         X_syms = [Xk]
         U_syms = []
@@ -1300,38 +1544,67 @@ class DiscontinuousControl:
         lbg += [0.0 for _ in range(2)]
         ubg += [0.0 for _ in range(2)]
 
-        if x_slacks:
-            x_slacks_vec = ca.vertcat(*x_slacks)
-            if close_to_bounds:
-                rho_x, _ = self.spiky_residual_weights(
-                    x_slack_block_sizes,
-                    min_spikes=1,
-                    max_spikes=1,
-                    base_scale=1e-6,
-                    spike_factor_range=(1e6, 1e8),
-                    spike_probability=1.0,
-                )
-            else:
-                rho_x = np.full(x_slacks_vec.numel(), 1e-6, dtype=float)
-
-            J += weighted_slack_cost(x_slacks_vec, rho_x)
-        else:
-            rho_x = np.zeros(0, dtype=float)
-
+        x_slacks_vec = ca.vertcat(*x_slacks)
         u_slacks_vec = ca.vertcat(*u_slacks)
-        rho_u, _ = self.spiky_residual_weights(
-            u_slack_block_sizes,
-            min_spikes=1,
-            max_spikes=3,
-            base_scale=1e-6,
-            spike_factor_range=(1e6, 1e8),
-            spike_probability=1.0,
+
+        # Q has positive entries only for the sampled target set T.  Sampling
+        # at most n_w - m_h targets enforces m_h + |T| <= n_w.
+        block_sizes = x_slack_block_sizes + u_slack_block_sizes
+        residual_pairs = []
+        offset = 0
+        for block_size in block_sizes:
+            for component in range(block_size):
+                residual_pairs.append(
+                    (offset + component, offset + block_size + component)
+                )
+            offset += 2 * block_size
+
+        n_state_pairs = sum(x_slack_block_sizes)
+        eligible_pairs = np.arange(len(residual_pairs), dtype=int)
+        if not close_to_bounds:
+            # Retain the historical option's intent: target only input bounds.
+            eligible_pairs = eligible_pairs[n_state_pairs:]
+
+        n_w = N + 2
+        m_h = 2
+        max_targets = min(n_w - m_h, eligible_pairs.size)
+        if max_targets < 1:
+            raise RuntimeError("No inequality constraints are available for targeting.")
+
+        forced_pair = n_state_pairs if u0_active_bound else None
+        if forced_pair is not None and forced_pair not in eligible_pairs:
+            eligible_pairs = np.append(eligible_pairs, forced_pair)
+            max_targets = min(n_w - m_h, eligible_pairs.size)
+
+        num_targets = np.random.randint(1, max_targets + 1)
+        if forced_pair is None:
+            target_pairs = np.random.choice(
+                eligible_pairs, size=num_targets, replace=False
+            )
+        else:
+            remaining = eligible_pairs[eligible_pairs != forced_pair]
+            extra_count = num_targets - 1
+            extras = np.random.choice(remaining, size=extra_count, replace=False)
+            target_pairs = np.r_[forced_pair, extras]
+
+        rho = np.zeros(2 * sum(block_sizes), dtype=float)
+        target_residuals = np.array(
+            [residual_pairs[pair][np.random.randint(2)] for pair in target_pairs],
+            dtype=int,
         )
-
+        rho[target_residuals] = 10.0 ** np.random.uniform(
+            0.0, 2.0, size=target_residuals.size
+        )
+        rho_x = rho[:x_slacks_vec.numel()]
+        rho_u = rho[x_slacks_vec.numel():]
+        J += weighted_slack_cost(x_slacks_vec, rho_x)
         J += weighted_slack_cost(u_slacks_vec, rho_u)
-
-        # Concatenate all slack weights, ordered like ``slack_stack`` below.
-        rho = np.concatenate([rho_x, rho_u])
+        self.last_slacked_problem_stats = {
+            "n_w": int(n_w),
+            "m_h": int(m_h),
+            "target_count": int(target_residuals.size),
+            "target_indices": target_residuals.copy(),
+        }
 
         X_stack = ca.hcat(X_syms)
         U_stack = ca.hcat(U_syms)
@@ -1386,7 +1659,50 @@ class DiscontinuousControl:
         w_mpc_opt = ca.Function("w_mpc_opt", [x_dec], [ca.vertcat(*w_mpc)])
         w_mpc_solution = w_mpc_opt(sol['x']).full().flatten()
 
-        if print_constraint_jacobian:
+        # Evaluate c* for every solve so batch statistics do not depend on
+        # whether verbose perturbation printing was requested.
+        slack_values = np.asarray(opt_slacks.full(), dtype=float).reshape(-1)
+        inactive_slack_values = np.where(
+            np.abs(slack_values) > 1e-8, slack_values, 0.0
+        )
+        constraint_jacobian_at_opt = slacked_constraint_jacobian(
+            sol['x']
+        ).full()
+        constraint_rows = []
+        for dec_idx in slack_decision_indices:
+            rows = np.flatnonzero(
+                np.abs(constraint_jacobian_at_opt[:, dec_idx]) > 1e-12
+            )
+            if rows.size != 1:
+                raise RuntimeError(
+                    f"Slack decision variable {dec_idx} appears in constraint rows {rows}"
+                )
+            constraint_rows.append(rows[0])
+        constraint_rows = np.asarray(constraint_rows, dtype=int)
+        slack_and_x0_indices = np.concatenate(
+            [np.arange(2), slack_decision_indices]
+        )
+        y_decision_indices = np.setdiff1d(
+            all_decision_indices, slack_and_x0_indices
+        )
+        g_jacobian_y = constraint_jacobian_at_opt[
+            np.ix_(constraint_rows, y_decision_indices)
+        ].T
+        weighted_inactive_slacks = rho * inactive_slack_values
+        c_star = -(g_jacobian_y @ weighted_inactive_slacks)
+        c_star_norm = float(np.linalg.norm(c_star))
+        c_star_scale = (
+            np.linalg.norm(g_jacobian_y, ord=np.inf)
+            * np.linalg.norm(weighted_inactive_slacks, ord=np.inf)
+        )
+        c_star_relative_residual = c_star_norm / max(1.0, c_star_scale)
+        self.last_slacked_c_star = np.asarray(c_star, dtype=float).reshape(-1)
+        self.last_slacked_c_star_norm = c_star_norm
+        self.last_slacked_c_star_is_zero = bool(
+            c_star_relative_residual <= 1e-6
+        )
+
+        if print_stationarity_perturbation:
             # From opt slacks, extract the weights of the nonzero slacks
             tol = 1e-8
 
@@ -1426,9 +1742,7 @@ class DiscontinuousControl:
 
             # Transpose the selected block so columns correspond to active
             # constraints, as required by the stationarity residual below.
-            g_jacobian_y_I = constraint_jacobian_at_opt[
-                np.ix_(constraint_row_I, y_decision_indices)
-            ].T
+            g_jacobian_y_I = constraint_jacobian_at_opt[np.ix_(constraint_row_I, y_decision_indices)].T
 
             assert g_jacobian_y_I.shape == (y_decision_indices.size, nonzero_slack_indices.size)
 
@@ -1454,25 +1768,16 @@ class DiscontinuousControl:
             # Evaluate the following optimality condition
             condition_residual = g_jacobian_y_I @ Q_I @ s_I
 
-            absolute_error = np.linalg.norm(condition_residual)
+            print("c*:", self.last_slacked_c_star)
+            print("||c*||:", self.last_slacked_c_star_norm)
+            print("c* numerically zero:", self.last_slacked_c_star_is_zero)
 
-            scale = (
-                np.linalg.norm(g_jacobian_y_I, ord=np.inf)
-                * np.linalg.norm(Q_I @ s_I, ord=np.inf)
-            )
-            relative_error = absolute_error / max(1.0, scale)
+            # # Check if the g_jacobian_y_I matrix is full column rank
+            # if np.linalg.matrix_rank(g_jacobian_y_I) < g_jacobian_y_I.shape[1]:
+            #     print("g_jacobian_y_I is not full column rank.")
 
-            holds = relative_error <= 1e-6
-
-            print("Absolute error:", absolute_error)
-            print("Condition holds:", holds)
-
-            # Check if the g_jacobian_y_I matrix is full column rank
-            if np.linalg.matrix_rank(g_jacobian_y_I) < g_jacobian_y_I.shape[1]:
-                print("g_jacobian_y_I is not full column rank.")
-
-            if np.linalg.matrix_rank(g_jacobian_y_I @ Q_I) < g_jacobian_y_I.shape[1]:
-                print("g_jacobian_y_I @ Q_I is not full column rank.")
+            # if np.linalg.matrix_rank(g_jacobian_y_I @ Q_I) < g_jacobian_y_I.shape[1]:
+            #     print("g_jacobian_y_I @ Q_I is not full column rank.")
 
         x_pred = np.array(X_opt.full())
         u_pred = np.array(U_opt.full()).flatten()
@@ -1842,19 +2147,24 @@ class DiscontinuousControl:
         max_attempts=1000,
         plot_results=True,
         slack_penalty="quadratic",
-        print_constraint_jacobian=False,
+        print_stationarity_perturbation=False,
         print_optimality=False,
         return_controls=False,
+        return_solutions=False,
     ):
-        """Collect initial states found by successful extreme-state solves.
+        """Collect feasible states using the paper's slacked NMPC formulation.
 
-        ``slack_penalty`` selects an L1 or quadratic penalty in the underlying
-        extreme-state optimization performed by :meth:`seek_x0`.
+        The retained ``slack_penalty`` argument must be ``"quadratic"``.
         """
         if num_samples < 0:
             raise ValueError("num_samples must be non-negative.")
         if max_attempts < 0:
             raise ValueError("max_attempts must be non-negative.")
+        if str(slack_penalty).lower() != "quadratic":
+            raise ValueError(
+                "The paper-compliant slacked formulation only supports "
+                "slack_penalty='quadratic'."
+            )
         if x_max is None:
             x_max = np.asarray(getattr(self, "state_bound", np.array([4.0, 4.0])), dtype=float)
         else:
@@ -1865,10 +2175,12 @@ class DiscontinuousControl:
                 raise ValueError("x_max must contain positive finite values.")
 
         samples = []
+        solutions = []
         u0_values = []
         attempts_run = 0
         successful_extreme_solves = 0
         feasible_candidates = 0
+        optimal_slacked_solutions = 0
         successful_statuses = {"Solve_Succeeded", "Solved_To_Acceptable_Level"}
 
         for attempt in range(max_attempts):
@@ -1883,7 +2195,7 @@ class DiscontinuousControl:
                 u0_active_bound=u0_active_bound,
                 plot_results=False,
                 slack_penalty=slack_penalty,
-                print_constraint_jacobian=print_constraint_jacobian,
+                print_stationarity_perturbation=print_stationarity_perturbation,
                 return_traj=True,
             )
 
@@ -1897,12 +2209,15 @@ class DiscontinuousControl:
                 _ = self.solve_MPC(x0_opt, warm_start=w_opt_slacked, return_traj=True, check_optimality=True)
 
             successful_extreme_solves += 1
+            if self.last_slacked_c_star_is_zero:
+                optimal_slacked_solutions += 1
             # if not self.is_feasible(x0_opt):
             #     print(f"Attempt {attempt + 1}: x0 not feasible, skipping...")
             #     continue
             feasible_candidates += 1
 
             samples.append(np.asarray(x0_opt, dtype=float))
+            solutions.append({"x": ca.DM(w_opt_slacked)})
             u0_values.append(float(u0_opt))
             print(f"Collected {len(samples)}/{num_samples}")
 
@@ -1910,6 +2225,10 @@ class DiscontinuousControl:
             print(f"Only collected {len(samples)} samples after {max_attempts} attempts")
         else:
             print(f"Collected {num_samples} samples")
+        print(
+            "Original-MPC-compatible slacked solutions (c*=0): "
+            f"{optimal_slacked_solutions}/{successful_extreme_solves}"
+        )
 
         def all_unique(samples):
             return len(samples) == len({
@@ -1930,7 +2249,14 @@ class DiscontinuousControl:
             "returned_samples": int(x0_samples.shape[0]),
             "attempts": int(attempts_run),
             "successful_extreme_solves": int(successful_extreme_solves),
+            "c_star_evaluated_solutions": int(successful_extreme_solves),
             "feasible_candidates": int(feasible_candidates),
+            "optimal_slacked_solutions": int(optimal_slacked_solutions),
+            "optimal_slacked_solution_rate": (
+                float(optimal_slacked_solutions / successful_extreme_solves)
+                if successful_extreme_solves else 0.0
+            ),
+            "c_star_relative_tolerance": 1e-6,
         }
 
         if plot_results:
@@ -1941,22 +2267,41 @@ class DiscontinuousControl:
                 show=True,
             )
 
+        if return_solutions:
+            return x0_samples, solutions
         if return_controls:
             return x0_samples, u0_values
         return x0_samples
 
-    def collect_feasible_samples_with_bilevel(self, x_max, num_samples, max_attempts=100, plot_results=False):
+    def collect_feasible_samples_with_bilevel(
+        self,
+        x_max,
+        num_samples,
+        max_attempts=100,
+        plot_results=False,
+        complementarity_method="ccopt",
+        scholtes_relaxations=(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6),
+        return_solutions=False,
+        warm_start=True,
+    ):
         """Collect initial states found by successful solves with bilevel optimization.
         The collected samples are guaranteed to be feasible and optimal for the MPC problem.
         """
         samples = []
+        solutions = []
         u0_values = []
         attempts_run = 0
         feasible_and_optimal_candidates = 0
         feasible_candidates = 0
         
         # Set up the bilevel optimization problem
-        bilevel_solver, w0, lbw, ubw, lbg, ubg, slack_block_sizes, mpc_vars, lambda_vars, slack_vars = self.bilevel_active_set(x_max, return_solver=True)
+        bilevel_solver, w0, lbw, ubw, lbg, ubg, slack_block_sizes, mpc_vars, lambda_vars, slack_vars = self.bilevel_active_set(
+            x_max,
+            return_solver=True,
+            complementarity_method=complementarity_method,
+            scholtes_relaxations=scholtes_relaxations,
+        )
+        bilevel_initial_guess = w0
 
         for attempt in range(max_attempts):
             if len(samples) >= num_samples:
@@ -1970,7 +2315,7 @@ class DiscontinuousControl:
                         max_spikes=2,
                         base_scale=1e-6,
                         spike_factor_range=(1e6, 1e8),
-                        spike_probability=0.6,
+                        spike_probability=1.0,
                     )
             
             x0_value = np.array([0.0, 0.0])
@@ -1978,7 +2323,7 @@ class DiscontinuousControl:
             
             # Solve the bilevel optimization problem with the sampled slack penalty weights
             sol = bilevel_solver(
-                x0=w0,
+                x0=bilevel_initial_guess,
                 lbx=lbw,
                 ubx=ubw,
                 lbg=lbg,
@@ -1993,6 +2338,8 @@ class DiscontinuousControl:
                 continue
             
             feasible_candidates += 1
+            if warm_start:
+                bilevel_initial_guess = sol['x']
             
             x0_feasible = sol['x'][0:2].full().flatten()
             
@@ -2043,6 +2390,7 @@ class DiscontinuousControl:
             if optimality:
                 feasible_and_optimal_candidates += 1
                 samples.append(x0_feasible)
+                solutions.append({"x": ca.DM(mpc_solution)})
                 u0_values.append(u0_feasible)
             print(f"Collected {len(samples)}/{num_samples}")
 
@@ -2055,6 +2403,8 @@ class DiscontinuousControl:
         u0_values = np.array(u0_values, dtype=float)
         self.last_feasible_sample_controls = u0_values
         self.last_feasible_sampling_stats = {
+            "complementarity_method": str(complementarity_method).lower(),
+            "warm_start": bool(warm_start),
             "requested_samples": int(num_samples),
             "returned_samples": int(x0_samples.shape[0]),
             "attempts": int(attempts_run),
@@ -2076,6 +2426,8 @@ class DiscontinuousControl:
                 show=True,
             )
         
+        if return_solutions:
+            return x0_samples, solutions
         return x0_samples
  
     def close_loop_simulation(self, x0, Nsim = 60, control_policy=None, plot_results=True):
@@ -2206,25 +2558,26 @@ if __name__ == "__main__":
     
     # sys.close_loop_simulation(x0, Nsim=3)
     # sys.plot_first_control(N=300)
-    # sys.collect_feasible_samples_with_slacked(
-    #     x_max=[4.0, 4.0],
-    #     close_to_bounds=True,
-    #     u0_active_bound=False,
-    #     num_samples=1000,
-    #     max_attempts=10000,
-    #     plot_results=True,
-    #     slack_penalty="quadratic",
-    #     print_constraint_jacobian=False,
-    #     print_optimality=True,
-    #     return_controls=False
-    # )
-    
-    sys.collect_feasible_samples_with_bilevel(
+    sys.collect_feasible_samples_with_slacked(
         x_max=[4.0, 4.0],
+        close_to_bounds=True,
+        u0_active_bound=False,
         num_samples=1000,
         max_attempts=10000,
         plot_results=True,
+        slack_penalty="quadratic",
+        print_stationarity_perturbation=True,
+        print_optimality=False,
+        return_controls=False
     )
+
+    # sys.collect_feasible_samples_with_bilevel(
+    #     x_max=[4.0, 4.0],
+    #     num_samples=1000,
+    #     max_attempts=10000,
+    #     complementarity_method="scholtes",
+    #     plot_results=True,
+    # )
     # sys.collect_feasible_samples_with_hit_and_run(
     #     num_samples=1000,
     #     num_feasible_seeds=5,

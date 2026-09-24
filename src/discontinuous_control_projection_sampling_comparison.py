@@ -1,16 +1,17 @@
 """Compare projection- and rollout-based sampling for the discontinuous-control MPC.
 
-The experiment compares four strategies for generating feasible initial states:
+The experiment compares five strategies for generating feasible initial states:
 
 1. ``uniform``            -- uniform candidates in the state box kept only when
    the original MPC is feasible for them.
-2. ``bilevel_projection`` -- candidates from the bilevel active-set sampler,
-   each one afterwards mapped through the nonlinear feasible-set projection.
-3. ``slacked_projection`` -- candidates from the slacked extreme-state sampler
-   (``seek_x0`` with randomly spiked residual weights), each one afterwards
-   mapped through the same projection.
+2. ``bilevel_projection`` -- bilevel reference solutions, local NMPC
+   linearization, bounded Hit-and-Run candidates, then nonlinear projection.
+3. ``slacked_projection`` -- slacked reference solutions followed by the same
+   linearization, bounded Hit-and-Run, and nonlinear projection pipeline.
 4. ``bilevel_rollout``    -- bilevel seeds propagated with closed-loop MPC
    rollouts, so every visited state becomes a sample.
+5. ``slacked_rollout``    -- slacked extreme-state seeds propagated the same
+   way, so the two rollout methods differ only in how the seed is generated.
 
 For every method the script reports accepted states, wall-clock time split into
 generation and projection/rollout phases, attempts, how often the projection
@@ -79,19 +80,27 @@ from models.discontinuous_control import DiscontinuousControl
 
 LABELS = {
     "uniform": "Uniform + MPC check",
-    "bilevel_projection": "Bilevel active set + projection",
-    "slacked_projection": "Slacked extreme states + projection",
+    "bilevel_projection": "Bilevel refs + linearized HR + projection",
+    "slacked_projection": "Slacked refs + linearized HR + projection",
     "bilevel_rollout": "Bilevel + closed-loop rollouts",
+    "slacked_rollout": "Slacked extreme states + closed-loop rollouts",
 }
 COLORS = {
     "uniform": "tab:green",
     "bilevel_projection": "tab:red",
     "slacked_projection": "tab:blue",
     "bilevel_rollout": "tab:orange",
+    "slacked_rollout": "tab:purple",
 }
-# A projection displacement below this norm means the candidate was already on
-# the feasible set, so the projection only re-solved the MPC.
-PROJECTION_MOVE_TOL = 1e-8
+# Label for the seed markers/legend in plot_post_processing, one per rollout
+# method, since the two differ only in how the seed is generated.
+ROLLOUT_SEED_LABELS = {
+    "bilevel_rollout": "bilevel seeds",
+    "slacked_rollout": "slacked seeds",
+}
+# Width of the method-label column in the printed summaries, wide enough for
+# the longest label so a long one never desynchronizes the columns after it.
+LABEL_WIDTH = max(len(label) for label in LABELS.values())
 # Resolution of the analytic feasible-set outline. The boundary is piecewise
 # smooth, so this is a plotting choice rather than an accuracy limit.
 FEASIBLE_SET_RESOLUTION = 1201
@@ -119,6 +128,7 @@ class SamplingResult:
     samples: np.ndarray
     elapsed_s: float
     attempts: int
+    successful_attempts: Optional[int] = None
     generation_s: float = 0.0
     post_processing_s: float = 0.0
     candidates: Optional[np.ndarray] = None
@@ -126,9 +136,11 @@ class SamplingResult:
     projection_attempts: int = 0
     projection_moved: int = 0
     projection_failures: int = 0
+    boundary_lp_failures: int = 0
     projection_shifts: np.ndarray = field(default_factory=lambda: np.empty(0))
     rollout_seeds: int = 0
     rollout_steps: int = 0
+    rollout_mpc_attempts: int = 0
     rollout_failures: int = 0
     rollout_left_box: int = 0
     rollout_converged: int = 0
@@ -150,6 +162,14 @@ class SamplingResult:
     # NLP solves consumed by the timed phases, and by the untimed verification.
     solver_calls: int = 0
     verification_solver_calls: int = 0
+    c_star_evaluated: int = 0
+    c_star_zero: int = 0
+    reference_solutions: int = 0
+    samples_per_reference: int = 0
+    reference_generation_time_s: float = 0.0
+    nonlinear_projection_time_s: float = 0.0
+    boundary_lp_time_s: float = 0.0
+    other_pipeline_time_s: float = 0.0
 
     @property
     def accepted(self) -> int:
@@ -170,10 +190,18 @@ class SamplingResult:
 
     @property
     def acceptance_rate(self) -> float:
-        """Accepted samples per attempt -- the complement a reader expects,
-        not necessarily ``1 - rejection_rate`` since ``rejected`` is a sum of
-        causes tracked for diagnosis rather than attempts - accepted."""
-        return self.accepted / self.attempts if self.attempts else float("nan")
+        """Successful candidate-generation attempts per attempt.
+
+        A rollout seed can produce several accepted states, so its numerator is
+        the number of successful bilevel seed solves rather than the number of
+        states returned by the complete rollout pipeline.
+        """
+        successes = (
+            self.accepted
+            if self.successful_attempts is None
+            else self.successful_attempts
+        )
+        return successes / self.attempts if self.attempts else float("nan")
 
     @property
     def solver_calls_per_attempt(self) -> float:
@@ -182,6 +210,12 @@ class SamplingResult:
     @property
     def solver_calls_per_sample(self) -> float:
         return self.solver_calls / self.accepted if self.accepted else float("nan")
+
+    @property
+    def state_yield_per_pipeline_operation(self) -> float:
+        """Accepted states per generator attempt or closed-loop MPC step."""
+        operations = self.attempts + self.rollout_mpc_attempts
+        return self.accepted / operations if operations else float("nan")
 
     @property
     def optimality_rejection_rate(self) -> float:
@@ -197,6 +231,10 @@ class SamplingResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-samples", type=int, default=100)
+    parser.add_argument(
+        "--num-references", type=int, default=10,
+        help="Np bilevel/slacked references; each produces num-samples/Np candidates.",
+    )
     parser.add_argument("--max-attempts", type=int, default=5000)
     parser.add_argument("--horizon", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -213,8 +251,17 @@ def parse_args() -> argparse.Namespace:
         help="State-distance weight Qx in the nonlinear feasible-set projection.",
     )
     parser.add_argument(
+        "--warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Warm-start consecutive bilevel solves and consecutive nonlinear "
+            "projections within each Hit-and-Run chain (default: enabled)."
+        ),
+    )
+    parser.add_argument(
         "--slack-penalty",
-        choices=("quadratic", "l1"),
+        choices=("quadratic",),
         default="quadratic",
         help="Penalty used by the slacked extreme-state sampler.",
     )
@@ -222,21 +269,22 @@ def parse_args() -> argparse.Namespace:
         "--close-to-bounds",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Drive the slacked sampler toward the bounds of the feasible set.",
+        help="Allow state, as well as input, inequalities in the sampled target set.",
     )
     parser.add_argument(
         "--rollout-steps",
         type=int,
         default=4,
-        help="Closed-loop MPC steps simulated from every bilevel seed.",
+        help="Closed-loop MPC steps simulated from every rollout seed.",
     )
     parser.add_argument(
         "--rollout-seeds",
         type=int,
         default=0,
         help=(
-            "Number of bilevel seeds for the rollout method. "
-            "0 selects the smallest count that can supply --num-samples."
+            "Number of seeds for each rollout method (bilevel_rollout and "
+            "slacked_rollout). 0 selects the smallest count that can supply "
+            "--num-samples."
         ),
     )
     parser.add_argument(
@@ -291,12 +339,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PACKAGE_ROOT / "results" / "discontinuous_control_projection_sampling",
+        default=PACKAGE_ROOT / "results" / "discontinuous_control_projection_sampling_4",
     )
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
     if args.num_samples <= 0:
         parser.error("--num-samples must be positive")
+    if args.num_references <= 0 or args.num_samples % args.num_references:
+        parser.error("--num-references must be positive and divide --num-samples")
     if args.max_attempts <= 0:
         parser.error("--max-attempts must be positive")
     if args.horizon < 2:
@@ -537,7 +587,11 @@ def draw_feasible_set(
         lower,
         upper,
         where=nonempty,
-        color="0.88",
+        # color="0.88",
+        color='aquamarine',
+        alpha=0.2,
+        edgecolor="0.9",
+        linewidth=2.0,
         zorder=0,
         label="MPC feasible set" if label else None,
     )
@@ -813,65 +867,6 @@ def mpc_first_control(
     return None if solution is None else float(solution["controls"][0])
 
 
-def project_candidates(
-    model: DiscontinuousControl,
-    candidates: np.ndarray,
-    projection_weight: float,
-    num_samples: int,
-    calls: Optional[SolverCalls] = None,
-) -> Tuple[np.ndarray, int, int, np.ndarray]:
-    """Project candidates onto the nonlinear MPC feasible set.
-
-    The origin is the projection warm start: it is feasible for every horizon
-    because the zero input sequence already satisfies the terminal constraint.
-    It is solved once here and handed to every projection, because
-    ``project_onto_feasible_set`` otherwise re-solves that same MPC on every
-    call. Each candidate then costs exactly one projection solve.
-    """
-    projected: List[np.ndarray] = []
-    shifts: List[float] = []
-    moved = 0
-    failures = 0
-
-    reference_solution = model.solver(
-        x0=model.w0,
-        lbx=model.lbw,
-        ubx=model.ubw,
-        lbg=model.lbg,
-        ubg=model.ubg,
-        p=np.zeros(2),
-    )
-    if calls is not None:
-        calls.add()
-
-    for candidate in candidates:
-        if len(projected) >= num_samples:
-            break
-        if calls is not None:
-            calls.add()
-        try:
-            point = model.project_onto_feasible_set(
-                candidate,
-                Qx=projection_weight,
-                reference_solution=reference_solution,
-            )
-        except RuntimeError:
-            failures += 1
-            continue
-        shift = float(np.linalg.norm(point - candidate))
-        shifts.append(shift)
-        if shift > PROJECTION_MOVE_TOL:
-            moved += 1
-        projected.append(point)
-
-    return (
-        normalize_samples(projected),
-        moved,
-        failures,
-        np.asarray(shifts, dtype=float),
-    )
-
-
 def collect_uniform(
     model: DiscontinuousControl,
     num_samples: int,
@@ -932,57 +927,75 @@ def collect_bilevel_projection(
     bounds: np.ndarray,
     seed: int,
     projection_weight: float,
+    num_references: int,
     verbose: bool,
+    warm_start: bool = True,
 ) -> SamplingResult:
-    # The bilevel residual-weight sampler draws from NumPy's legacy global RNG.
     np.random.seed(seed)
     start = perf_counter()
     try:
         with quiet(verbose):
-            candidates = model.collect_feasible_samples_with_bilevel(
+            samples = model.collect_feasible_samples_with_hit_and_run(
                 x_max=bounds,
                 num_samples=num_samples,
-                max_attempts=max_attempts,
+                num_feasible_seeds=num_references,
+                max_seed_attempts=max_attempts,
+                projection_Qx=projection_weight,
+                reference_method="bilevel",
+                random_seed=seed,
+                warm_start=warm_start,
                 plot_results=False,
             )
     except Exception as exc:
         raise RuntimeError(
-            "The bilevel sampler failed. It needs the CasADi ccopt plugin."
+            "The bilevel-reference/linearization/projection pipeline failed. "
+            "Reference generation requires the CasADi ccopt plugin."
         ) from exc
-    generation_s = perf_counter() - start
-    candidates = normalize_samples(candidates)
-    stats = model.last_feasible_sampling_stats
-    attempts = int(stats["attempts"])
-    # The sampler solves, then screens each solution with a reduced-Hessian
-    # (SOSC) test, so its two loss channels are reported separately.
-    solved = int(stats["feasible_candidates"])
-    optimal = int(stats["feasible_and_optimal_candidates"])
-    # The sampler calls its ccopt solver exactly once per attempt.
-    calls = SolverCalls()
-    calls.add(attempts)
-
-    start = perf_counter()
-    with quiet(verbose):
-        samples, moved, failures, shifts = project_candidates(
-            model, candidates, projection_weight, num_samples, calls=calls
-        )
-    projection_s = perf_counter() - start
+    elapsed = perf_counter() - start
+    linear = model.last_linearized_sampling_stats
+    reference = linear["reference_statistics"]
+    candidates = normalize_samples(linear["accepted_raw_candidates"])
+    samples = normalize_samples(samples)
+    shifts = np.linalg.norm(samples - candidates, axis=1)
+    attempts = int(reference["attempts"])
+    solved = int(reference["feasible_candidates"])
+    optimal = int(reference["feasible_and_optimal_candidates"])
+    projection_attempts = (
+        int(linear["chain_updates"]) - int(linear["boundary_lp_failures"])
+    )
 
     return SamplingResult(
         method="bilevel_projection",
-        solver_calls=calls.count,
+        successful_attempts=optimal,
+        solver_calls=attempts + projection_attempts,
         solver_failures=attempts - solved,
         optimality_rejections=solved - optimal,
         samples=samples,
-        elapsed_s=generation_s + projection_s,
-        generation_s=generation_s,
-        post_processing_s=projection_s,
+        elapsed_s=elapsed,
+        generation_s=float(linear["reference_time_s"]),
+        post_processing_s=(
+            float(linear["projection_time_s"])
+            + float(linear["boundary_lp_time_s"])
+        ),
+        other_pipeline_time_s=max(
+            elapsed
+            - float(linear["reference_time_s"])
+            - float(linear["projection_time_s"])
+            - float(linear["boundary_lp_time_s"]),
+            0.0,
+        ),
         attempts=attempts,
         candidates=candidates,
-        projection_attempts=int(candidates.shape[0]),
-        projection_moved=moved,
-        projection_failures=failures,
+        projection_attempts=projection_attempts,
+        projection_moved=int(linear["projection_needed"]),
+        projection_failures=int(linear["projection_failures"]),
+        boundary_lp_failures=int(linear["boundary_lp_failures"]),
         projection_shifts=shifts,
+        reference_solutions=int(np.asarray(linear["feasible_seeds"]).shape[0]),
+        samples_per_reference=int(linear["samples_per_reference"]),
+        reference_generation_time_s=float(linear["reference_time_s"]),
+        nonlinear_projection_time_s=float(linear["projection_time_s"]),
+        boundary_lp_time_s=float(linear["boundary_lp_time_s"]),
     )
 
 
@@ -995,54 +1008,73 @@ def collect_slacked_projection(
     projection_weight: float,
     slack_penalty: str,
     close_to_bounds: bool,
+    num_references: int,
     verbose: bool,
+    warm_start: bool = True,
 ) -> SamplingResult:
     # The spiked residual weights also come from the legacy global RNG, so the
     # same seed makes this sampler reproducible next to the bilevel one.
     np.random.seed(seed)
     start = perf_counter()
     with quiet(verbose):
-        candidates = model.collect_feasible_samples_with_slacked(
+        samples = model.collect_feasible_samples_with_hit_and_run(
             x_max=bounds,
-            close_to_bounds=close_to_bounds,
             num_samples=num_samples,
-            max_attempts=max_attempts,
-            plot_results=False,
+            num_feasible_seeds=num_references,
+            max_seed_attempts=max_attempts,
+            projection_Qx=projection_weight,
+            reference_method="slacked",
             slack_penalty=slack_penalty,
+            close_to_bounds=close_to_bounds,
+            random_seed=seed,
+            warm_start=warm_start,
+            plot_results=False,
         )
-    generation_s = perf_counter() - start
-    candidates = normalize_samples(candidates)
-    stats = model.last_feasible_sampling_stats
-    attempts = int(stats["attempts"])
-    # The slacked sampler has no optimality screen of its own: every solved
-    # extreme-state problem is kept, so local optimality is only measured
-    # afterwards by the SOSC check in verify_results.
-    solved = int(stats["successful_extreme_solves"])
-    # Each attempt is one seek_x0 call, which solves its NLP exactly once.
-    calls = SolverCalls()
-    calls.add(attempts)
-
-    start = perf_counter()
-    with quiet(verbose):
-        samples, moved, failures, shifts = project_candidates(
-            model, candidates, projection_weight, num_samples, calls=calls
-        )
-    projection_s = perf_counter() - start
+    elapsed = perf_counter() - start
+    linear = model.last_linearized_sampling_stats
+    reference = linear["reference_statistics"]
+    candidates = normalize_samples(linear["accepted_raw_candidates"])
+    samples = normalize_samples(samples)
+    shifts = np.linalg.norm(samples - candidates, axis=1)
+    attempts = int(reference["attempts"])
+    solved = int(reference["successful_extreme_solves"])
+    projection_attempts = (
+        int(linear["chain_updates"]) - int(linear["boundary_lp_failures"])
+    )
 
     return SamplingResult(
         method="slacked_projection",
-        solver_calls=calls.count,
+        successful_attempts=solved,
+        solver_calls=attempts + projection_attempts,
         solver_failures=attempts - solved,
         samples=samples,
-        elapsed_s=generation_s + projection_s,
-        generation_s=generation_s,
-        post_processing_s=projection_s,
+        elapsed_s=elapsed,
+        generation_s=float(linear["reference_time_s"]),
+        post_processing_s=(
+            float(linear["projection_time_s"])
+            + float(linear["boundary_lp_time_s"])
+        ),
+        other_pipeline_time_s=max(
+            elapsed
+            - float(linear["reference_time_s"])
+            - float(linear["projection_time_s"])
+            - float(linear["boundary_lp_time_s"]),
+            0.0,
+        ),
         attempts=attempts,
+        c_star_evaluated=solved,
+        c_star_zero=int(reference["optimal_slacked_solutions"]),
         candidates=candidates,
-        projection_attempts=int(candidates.shape[0]),
-        projection_moved=moved,
-        projection_failures=failures,
+        projection_attempts=projection_attempts,
+        projection_moved=int(linear["projection_needed"]),
+        projection_failures=int(linear["projection_failures"]),
+        boundary_lp_failures=int(linear["boundary_lp_failures"]),
         projection_shifts=shifts,
+        reference_solutions=int(np.asarray(linear["feasible_seeds"]).shape[0]),
+        samples_per_reference=int(linear["samples_per_reference"]),
+        reference_generation_time_s=float(linear["reference_time_s"]),
+        nonlinear_projection_time_s=float(linear["projection_time_s"]),
+        boundary_lp_time_s=float(linear["boundary_lp_time_s"]),
     )
 
 
@@ -1056,6 +1088,7 @@ def collect_bilevel_rollout(
     rollout_steps: int,
     rollout_seeds: int,
     verbose: bool,
+    warm_start: bool = True,
     rollout_tol: float = ROLLOUT_ORIGIN_TOL,
     dedupe: bool = True,
 ) -> SamplingResult:
@@ -1141,6 +1174,7 @@ def collect_bilevel_rollout(
                     num_samples=requested,
                     max_attempts=remaining_attempts,
                     plot_results=False,
+                    warm_start=warm_start,
                 )
         except Exception as exc:
             raise RuntimeError(
@@ -1218,14 +1252,186 @@ def collect_bilevel_rollout(
         elapsed_s=generation_s + rollout_s,
         generation_s=generation_s,
         post_processing_s=rollout_s,
-        # Bilevel seed attempts plus every simulated closed-loop step.
-        attempts=attempts + simulated_steps,
+        # Acceptance is defined on bilevel seed generation. Closed-loop MPC
+        # steps are solver calls, but they are not bilevel sampling attempts.
+        attempts=attempts,
+        successful_attempts=len(seed_states),
         candidates=normalize_samples(seed_states),
-        # Seeds lost to the ccopt solver or to a failed closed-loop solve.
-        solver_failures=solver_failures + rollout_failures,
+        # Keep seed-generation failures separate from rollout MPC failures.
+        solver_failures=solver_failures,
         optimality_rejections=optimality_rejections,
         rollout_seeds=len(seed_states),
         rollout_steps=rollout_steps,
+        rollout_mpc_attempts=simulated_steps,
+        rollout_failures=rollout_failures,
+        rollout_left_box=left_box,
+        rollout_converged=converged,
+        rollout_duplicates=duplicates,
+        rollout_batches=batches,
+        trajectories=trajectories,
+    )
+
+
+def collect_slacked_rollout(
+    model: DiscontinuousControl,
+    num_samples: int,
+    max_attempts: int,
+    bounds: np.ndarray,
+    model_bounds: np.ndarray,
+    seed: int,
+    rollout_steps: int,
+    rollout_seeds: int,
+    slack_penalty: str,
+    close_to_bounds: bool,
+    verbose: bool,
+    rollout_tol: float = ROLLOUT_ORIGIN_TOL,
+    dedupe: bool = True,
+) -> SamplingResult:
+    """Propagate slacked extreme-state seeds with closed-loop MPC rollouts.
+
+    Identical closed-loop propagation to :func:`collect_bilevel_rollout`; only
+    the seed generator differs. The slacked sampler records its pre-rollout
+    ``c_star`` first-order
+    compatibility statistic without rejecting seeds, so a seed batch is
+    reported as solver failures plus that bookkeeping.
+    """
+    states_per_rollout = rollout_steps + 1
+    explicit_seeds = rollout_seeds > 0
+
+    np.random.seed(seed)
+    solver_rng = np.random.default_rng(seed + 1)
+    samples: List[np.ndarray] = []
+    trajectories: List[np.ndarray] = []
+    seed_states: List[np.ndarray] = []
+    generation_s = 0.0
+    rollout_s = 0.0
+    attempts = 0
+    solver_failures = 0
+    c_star_evaluated = 0
+    c_star_zero = 0
+    simulated_steps = 0
+    rollout_failures = 0
+    left_box = 0
+    converged = 0
+    duplicates = 0
+    batches = 0
+    calls = SolverCalls()
+    batch_yield: Optional[float] = None
+    seen: set = set()
+
+    def register(state: np.ndarray) -> bool:
+        """Record a state, reporting whether it is new."""
+        if not dedupe:
+            return True
+        key = tuple(np.round(state, 9))
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+    remaining_attempts = max_attempts
+
+    while len(samples) < num_samples and remaining_attempts > 0 and batches < ROLLOUT_MAX_BATCHES:
+        missing = num_samples - len(samples)
+        if explicit_seeds:
+            requested = rollout_seeds
+        elif batch_yield is not None:
+            requested = int(np.ceil(ROLLOUT_SEED_MARGIN * missing / batch_yield))
+        else:
+            requested = int(np.ceil(missing / states_per_rollout))
+        requested = max(requested, 1)
+        batch_start_samples = len(samples)
+        batch_start_seeds = len(seed_states)
+
+        start = perf_counter()
+        with quiet(verbose):
+            seeds = model.collect_feasible_samples_with_slacked(
+                x_max=bounds,
+                close_to_bounds=close_to_bounds,
+                num_samples=requested,
+                max_attempts=remaining_attempts,
+                plot_results=False,
+                slack_penalty=slack_penalty,
+            )
+        generation_s += perf_counter() - start
+        batches += 1
+
+        seeds = normalize_samples(seeds)
+        stats = model.last_feasible_sampling_stats
+        batch_attempts = int(stats["attempts"])
+        attempts += batch_attempts
+        remaining_attempts -= batch_attempts
+        # One seek_x0 solve per seed attempt.
+        calls.add(batch_attempts)
+        solved = int(stats["successful_extreme_solves"])
+        solver_failures += batch_attempts - solved
+        c_star_evaluated += solved
+        c_star_zero += int(stats["optimal_slacked_solutions"])
+        if seeds.shape[0] == 0:
+            break
+        seed_states.extend(seeds)
+
+        start = perf_counter()
+        for seed_state in seeds:
+            if len(samples) >= num_samples:
+                break
+            if not register(seed_state):
+                duplicates += 1
+                continue
+            trajectory = [seed_state]
+            samples.append(seed_state)
+            state = seed_state
+            for _ in range(rollout_steps):
+                if len(samples) >= num_samples:
+                    break
+                if np.max(np.abs(state)) <= rollout_tol:
+                    converged += 1
+                    break
+                control = mpc_first_control(
+                    model, state, rng=solver_rng, calls=calls
+                )
+                simulated_steps += 1
+                if control is None:
+                    rollout_failures += 1
+                    break
+                state = np.asarray(
+                    model.step(state, [control]).full(), dtype=float
+                ).reshape(2)
+                if np.any(np.abs(state) > model_bounds + 1e-6):
+                    left_box += 1
+                    break
+                if not register(state):
+                    duplicates += 1
+                    break
+                trajectory.append(state)
+                samples.append(state)
+            trajectories.append(np.asarray(trajectory, dtype=float))
+        rollout_s += perf_counter() - start
+
+        new_seeds = len(seed_states) - batch_start_seeds
+        if new_seeds > 0:
+            batch_yield = max(
+                (len(samples) - batch_start_samples) / new_seeds, 0.1
+            )
+
+        if explicit_seeds:
+            break
+
+    return SamplingResult(
+        method="slacked_rollout",
+        samples=normalize_samples(samples),
+        solver_calls=calls.count,
+        elapsed_s=generation_s + rollout_s,
+        generation_s=generation_s,
+        post_processing_s=rollout_s,
+        attempts=attempts,
+        successful_attempts=len(seed_states),
+        candidates=normalize_samples(seed_states),
+        solver_failures=solver_failures,
+        c_star_evaluated=c_star_evaluated,
+        c_star_zero=c_star_zero,
+        rollout_seeds=len(seed_states),
+        rollout_steps=rollout_steps,
+        rollout_mpc_attempts=simulated_steps,
         rollout_failures=rollout_failures,
         rollout_left_box=left_box,
         rollout_converged=converged,
@@ -1287,22 +1493,47 @@ def statistics_row(result: SamplingResult, requested: int) -> dict:
     samples = result.samples
     radii = np.linalg.norm(samples, axis=1) if samples.size else np.empty(0)
     shifts = result.projection_shifts
+    pre_criterion, pre_passed, pre_evaluated = preprojection_optimality(result)
     return {
         "method": result.method,
         "label": LABELS[result.method],
         "requested": requested,
         "accepted": result.accepted,
+        "successful_attempts": (
+            result.accepted
+            if result.successful_attempts is None
+            else result.successful_attempts
+        ),
         "verified_feasible": result.verified_feasible,
         "analytic_feasible": result.analytic_feasible,
         "locally_optimal": result.locally_optimal,
         "sosc_degenerate": result.sosc_degenerate,
+        "preprojection_optimality_criterion": pre_criterion,
+        "preprojection_optimality_passed": pre_passed,
+        "preprojection_optimality_evaluated": pre_evaluated,
+        "preprojection_optimality_rate": (
+            pre_passed / pre_evaluated if pre_evaluated else float("nan")
+        ),
+        "c_star_zero": result.c_star_zero,
+        "c_star_evaluated": result.c_star_evaluated,
+        "c_star_zero_rate": (
+            result.c_star_zero / result.c_star_evaluated
+            if result.c_star_evaluated
+            else float("nan")
+        ),
+        "reference_solutions": result.reference_solutions,
+        "samples_per_reference": result.samples_per_reference,
         "attempts": result.attempts,
         "solver_calls": result.solver_calls,
         "solver_calls_per_attempt": result.solver_calls_per_attempt,
         "solver_calls_per_accepted_sample": result.solver_calls_per_sample,
+        "state_yield_per_pipeline_operation": (
+            result.state_yield_per_pipeline_operation
+        ),
         "verification_solver_calls": result.verification_solver_calls,
         "rejected": result.rejected,
         "rejection_rate": result.rejection_rate,
+        "acceptance_rate": result.acceptance_rate,
         "infeasible_rejections": result.infeasible_rejections,
         "solver_failures": result.solver_failures,
         "optimality_rejections": result.optimality_rejections,
@@ -1311,14 +1542,22 @@ def statistics_row(result: SamplingResult, requested: int) -> dict:
         "computation_time_s": result.elapsed_s,
         "generation_time_s": result.generation_s,
         "post_processing_time_s": result.post_processing_s,
+        "active_set_exploration_time_s": result.generation_s,
+        "rollout_time_s": result.post_processing_s,
+        "reference_generation_time_s": result.reference_generation_time_s,
+        "nonlinear_projection_time_s": result.nonlinear_projection_time_s,
+        "boundary_lp_time_s": result.boundary_lp_time_s,
+        "other_pipeline_time_s": result.other_pipeline_time_s,
         "seconds_per_accepted_sample": result.seconds_per_sample,
         "projection_attempts": result.projection_attempts,
         "projection_moved": result.projection_moved,
         "projection_failures": result.projection_failures,
+        "boundary_lp_failures": result.boundary_lp_failures,
         "mean_projection_shift": float(np.mean(shifts)) if shifts.size else float("nan"),
         "max_projection_shift": float(np.max(shifts)) if shifts.size else float("nan"),
         "rollout_seeds": result.rollout_seeds,
         "rollout_steps": result.rollout_steps,
+        "rollout_mpc_attempts": result.rollout_mpc_attempts,
         "rollout_failures": result.rollout_failures,
         "rollout_left_box": result.rollout_left_box,
         "rollout_converged": result.rollout_converged,
@@ -1353,10 +1592,9 @@ def save_results(
                 comments="",
             )
 
-    rollout = next(
-        (result for result in results if result.method == "bilevel_rollout"), None
-    )
-    if rollout is not None and rollout.trajectories:
+    for rollout in results:
+        if not rollout.method.endswith("_rollout") or not rollout.trajectories:
+            continue
         rows_out = [
             np.column_stack(
                 (
@@ -1368,7 +1606,7 @@ def save_results(
             for index, traj in enumerate(rollout.trajectories)
         ]
         np.savetxt(
-            output_dir / "rollout_trajectories.csv",
+            output_dir / f"rollout_trajectories_{rollout.method}.csv",
             np.vstack(rows_out),
             delimiter=",",
             header="rollout,step,x_1,x_2",
@@ -1385,11 +1623,13 @@ def save_results(
     payload = {
         "configuration": {
             "num_samples": args.num_samples,
+            "num_references": args.num_references,
             "max_attempts": args.max_attempts,
             "horizon": args.horizon,
             "seed": args.seed,
             "state_bound": args.state_bound,
             "projection_weight": args.projection_weight,
+            "warm_start": args.warm_start,
             "slack_penalty": args.slack_penalty,
             "close_to_bounds": args.close_to_bounds,
             "rollout_steps": args.rollout_steps,
@@ -1412,15 +1652,23 @@ def save_results(
             "channels are solver failures and optimality rejections."
         ),
         "attempt_definition": (
-            "An attempt is one try at producing a feasible and optimal sample: "
-            "one uniform draw, one bilevel or slacked generator solve, or one "
-            "closed-loop rollout step. solver_calls counts NLP solves instead, "
+            "An attempt is one candidate-generation try: one uniform draw or "
+            "one bilevel or slacked generator solve. For bilevel_rollout and "
+            "slacked_rollout, the acceptance rate is successful seed solves / "
+            "seed attempts; closed-loop MPC steps are recorded separately as "
+            "rollout_mpc_attempts. solver_calls counts every timed NLP solve, "
             "so the two differ whenever a try costs more than one solve: an MPC "
             "solve retried from a fresh initial guess (up to 1 + mpc_restarts "
             "calls) and a projected candidate, which pays its generator solve "
             "plus one projection solve. verification_solver_calls covers the "
             "post-hoc feasibility and SOSC pass and is excluded from the timed "
             "totals."
+        ),
+        "state_yield_definition": (
+            "state_yield_per_pipeline_operation is accepted states / (candidate-"
+            "generation attempts + closed-loop MPC attempts). For bilevel_rollout "
+            "and slacked_rollout this preserves the former combined "
+            "pipeline-efficiency quantity without calling it an acceptance rate."
         ),
         "local_optimality_definition": (
             "locally_optimal counts accepted samples whose MPC solution "
@@ -1438,14 +1686,20 @@ def save_results(
                 "feasible-set projection."
             ),
             "slacked_projection": (
-                "Randomly spiked slack weights push states to the bounds, then "
-                "the nonlinear feasible-set projection repairs them."
+                "Sampled slack weights explore active sets; c*=0 first-order "
+                "compatibility is recorded before nonlinear projection."
             ),
             "bilevel_rollout": (
                 "Bilevel seeds propagated with closed-loop MPC. The MPC bounds "
                 "only x_0, not its predicted trajectory, so a successor can "
                 "leave the state box and stop the rollout (rollout_left_box); "
                 "such states are not admissible initial states and are dropped."
+            ),
+            "slacked_rollout": (
+                "Slacked extreme-state seeds propagated with closed-loop MPC, "
+                "identical to bilevel_rollout except for the seed generator. "
+                "Pre-projection c*=0 compatibility is recorded without "
+                "rejecting seeds."
             ),
         },
         "statistics": rows,
@@ -1515,7 +1769,7 @@ def plot_samples(
                 edgecolors="none",
                 zorder=3,
             )
-        ax.set_title(f"{LABELS[result.method]}\n$n={result.accepted}$")
+        # ax.set_title(f"{LABELS[result.method]}\n$n={result.accepted}$")
         ax.set_xlim(-1.04 * bounds[0], 1.04 * bounds[0])
         ax.set_ylim(-1.04 * bounds[1], 1.04 * bounds[1])
         ax.set_xlabel(r"$x_{0,1}$")
@@ -1524,7 +1778,7 @@ def plot_samples(
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
-            ax.legend(handles, labels, loc="upper left", fontsize=8)
+            ax.legend(handles, labels, loc="best", fontsize=10)
 
     colorbar_mappable = matplotlib.cm.ScalarMappable(norm=normalization, cmap=colormap)
     colorbar_mappable.set_array([])
@@ -1548,10 +1802,8 @@ def plot_post_processing(
     projection_results = [
         result for result in results if result.projection_attempts and result.candidates is not None
     ]
-    rollout = next(
-        (result for result in results if result.method == "bilevel_rollout"), None
-    )
-    panels = projection_results + ([rollout] if rollout is not None else [])
+    rollout_results = [result for result in results if result.method.endswith("_rollout")]
+    panels = projection_results + rollout_results
     if not panels:
         return
 
@@ -1560,7 +1812,7 @@ def plot_post_processing(
     for ax, result in zip(axes, panels):
         draw_feasible_set(ax, profile, model_bounds, label=True)
         draw_sampling_box(ax, bounds, model_bounds, label=True)
-        if result.method == "bilevel_rollout":
+        if result.method.endswith("_rollout"):
             for trajectory in result.trajectories:
                 ax.plot(
                     trajectory[:, 0],
@@ -1575,7 +1827,7 @@ def plot_post_processing(
                     result.candidates[:, 1],
                     s=34,
                     color="tab:red",
-                    label="bilevel seeds",
+                    label=ROLLOUT_SEED_LABELS.get(result.method, "seeds"),
                     zorder=3,
                 )
             if result.samples.size:
@@ -1938,17 +2190,32 @@ def plot_statistics(results: List[SamplingResult], output_dir: Path) -> None:
     fig.savefig(output_dir / "sampling_performance.pdf", bbox_inches="tight")
 
 
+def preprojection_optimality(result: SamplingResult) -> Tuple[str, int, int]:
+    """Return criterion, passed count, and evaluated pre-projection count."""
+    if result.method.startswith("bilevel"):
+        evaluated = result.attempts - result.solver_failures
+        return "SOSC", evaluated - result.optimality_rejections, evaluated
+    if result.method.startswith("slacked"):
+        return "c*=0", result.c_star_zero, result.c_star_evaluated
+    return "-", 0, 0
+
+
 def print_summary(results: List[SamplingResult]) -> None:
     print("\nSampling summary")
-    print("-" * 146)
-    print(
-        f"{'method':<36} {'accepted':>9} {'in set':>7} {'SOSC':>6} {'attempts':>9} "
+    header = (
+        f"{'method':<{LABEL_WIDTH}} {'pre criterion':>13} {'pre passed':>11} "
+        f"{'accepted':>9} {'in set':>7} {'SOSC':>6} {'attempts':>9} "
         f"{'solves':>8} {'/attempt':>9} {'infeas':>7} {'failed':>7} {'not opt':>8} "
         f"{'time [s]':>10} {'s/sample':>10}"
     )
+    print("-" * len(header))
+    print(header)
     for result in results:
+        criterion, pre_passed, pre_evaluated = preprojection_optimality(result)
+        pre_count = f"{pre_passed}/{pre_evaluated}" if pre_evaluated else "-"
         print(
-            f"{LABELS[result.method]:<36} {result.accepted:>9d} "
+            f"{LABELS[result.method]:<{LABEL_WIDTH}} {criterion:>13} {pre_count:>11} "
+            f"{result.accepted:>9d} "
             f"{result.analytic_feasible:>7d} {result.locally_optimal:>6d} "
             f"{result.attempts:>9d} {result.solver_calls:>8d} "
             f"{result.solver_calls_per_attempt:>9.2f} "
@@ -1957,12 +2224,24 @@ def print_summary(results: List[SamplingResult]) -> None:
             f"{result.elapsed_s:>10.3f} {result.seconds_per_sample:>10.4f}"
         )
     print(
-        "\ncolumns: 'in set' = inside the analytic feasible set, 'SOSC' = accepted "
+        "\n'pre passed' is evaluated before projection: bilevel uses its original-MPC "
+        "SOSC screen; slacked uses c*=0 first-order compatibility.\n"
+        "columns: 'in set' = inside the analytic feasible set, 'SOSC' = accepted "
         "samples whose MPC\nsolution is a strict local minimizer. An attempt is one "
         "try at a feasible and optimal sample;\n'solves' counts the NLP solves those "
         "tries actually cost. Rejections are split into infeasible\ncandidates, "
-        "failed solves and solutions that failed the local-optimality screen."
+        "failed solves and solutions that failed the local-optimality screen.\n"
+        "For rollouts, attempts are bilevel seed tries; closed-loop MPC steps "
+        "are included in solves, not attempts."
     )
+    for result in results:
+        if result.reference_solutions:
+            print(
+                f"{LABELS[result.method]} pipeline: "
+                f"Np={result.reference_solutions}, "
+                f"M={result.samples_per_reference}, "
+                f"Np*M={result.reference_solutions * result.samples_per_reference}."
+            )
 
 
 def collect_all(
@@ -1994,7 +2273,9 @@ def collect_all(
             bounds=bounds,
             seed=seed,
             projection_weight=args.projection_weight,
+            num_references=args.num_references,
             verbose=args.verbose,
+            warm_start=args.warm_start,
         ),
         collect_slacked_projection(
             model,
@@ -2005,7 +2286,9 @@ def collect_all(
             projection_weight=args.projection_weight,
             slack_penalty=args.slack_penalty,
             close_to_bounds=args.close_to_bounds,
+            num_references=args.num_references,
             verbose=args.verbose,
+            warm_start=args.warm_start,
         ),
         collect_bilevel_rollout(
             model,
@@ -2016,6 +2299,22 @@ def collect_all(
             seed=seed,
             rollout_steps=args.rollout_steps,
             rollout_seeds=args.rollout_seeds,
+            verbose=args.verbose,
+            warm_start=args.warm_start,
+            rollout_tol=args.rollout_tol,
+            dedupe=args.rollout_dedupe,
+        ),
+        collect_slacked_rollout(
+            model,
+            num_samples=args.num_samples,
+            max_attempts=args.max_attempts,
+            bounds=bounds,
+            model_bounds=model_bounds,
+            seed=seed,
+            rollout_steps=args.rollout_steps,
+            rollout_seeds=args.rollout_seeds,
+            slack_penalty=args.slack_penalty,
+            close_to_bounds=args.close_to_bounds,
             verbose=args.verbose,
             rollout_tol=args.rollout_tol,
             dedupe=args.rollout_dedupe,
@@ -2036,10 +2335,20 @@ def repeat_statistics(
     and SOSC are not re-verified here, since they vary far less across seeds
     than timing does and the check itself is the expensive part of a repeat.
     """
+    timing_fields = (
+        "elapsed_s",
+        "generation_s",
+        "post_processing_s",
+        "reference_generation_time_s",
+        "nonlinear_projection_time_s",
+        "boundary_lp_time_s",
+        "other_pipeline_time_s",
+    )
     per_method: Dict[str, Dict[str, List[float]]] = {
         result.method: {
             "seconds_per_sample": [result.seconds_per_sample],
             "acceptance_rate": [result.acceptance_rate],
+            **{field: [getattr(result, field)] for field in timing_fields},
         }
         for result in primary_results
     }
@@ -2048,6 +2357,8 @@ def repeat_statistics(
         for result in collect_all(model, args, bounds, model_bounds, args.seed + repeat):
             per_method[result.method]["seconds_per_sample"].append(result.seconds_per_sample)
             per_method[result.method]["acceptance_rate"].append(result.acceptance_rate)
+            for field in timing_fields:
+                per_method[result.method][field].append(getattr(result, field))
 
     summary: Dict[str, Dict[str, Dict[str, float]]] = {}
     for method, metrics in per_method.items():
@@ -2075,11 +2386,12 @@ def print_paper_table(
     (a single value, with std shown as "n/a", when ``repeats`` is 1).
     """
     print("\nCondensed results (for a paper)")
-    print("-" * 100)
     header = (
-        f"{'method':<36} {'accepted':>10} {'feasible':>9} {'SOSC':>7} "
+        f"{'method':<{LABEL_WIDTH}} {'pre criterion':>13} {'pre passed':>11} "
+        f"{'accepted':>10} {'feasible':>9} {'SOSC':>7} "
         f"{'accept. rate [%]':>18} {'time/sample [ms]':>18}"
     )
+    print("-" * len(header))
     print(header)
     for result in results:
         accept = stats[result.method]["acceptance_rate"]
@@ -2090,6 +2402,8 @@ def print_paper_table(
         sosc_pct = (
             100.0 * result.locally_optimal / result.accepted if result.accepted else float("nan")
         )
+        criterion, pre_passed, pre_evaluated = preprojection_optimality(result)
+        pre_count = f"{pre_passed}/{pre_evaluated}" if pre_evaluated else "-"
         if repeats > 1:
             accept_str = f"{100.0 * accept['mean']:.1f} +/- {100.0 * accept['std']:.1f}"
             time_str = f"{1000.0 * timing['mean']:.2f} +/- {1000.0 * timing['std']:.2f}"
@@ -2097,10 +2411,11 @@ def print_paper_table(
             accept_str = f"{100.0 * accept['mean']:.1f}"
             time_str = f"{1000.0 * timing['mean']:.2f}"
         print(
-            f"{LABELS[result.method]:<36} {result.accepted:>5d}/{requested:<4d} "
+            f"{LABELS[result.method]:<{LABEL_WIDTH}} {criterion:>13} {pre_count:>11} "
+            f"{result.accepted:>5d}/{requested:<4d} "
             f"{feasible_pct:>8.1f} {sosc_pct:>6.1f} {accept_str:>18} {time_str:>18}"
         )
-    print("-" * 100)
+    print("-" * len(header))
     if repeats > 1:
         print(f"acceptance rate and time/sample are mean +/- std over {repeats} independent runs.")
     else:
@@ -2109,9 +2424,17 @@ def print_paper_table(
             "for a mean +/- std suitable for a paper."
         )
     print(
+        "'pre passed' is computed before projection: original-MPC SOSC for "
+        "bilevel and c*=0 first-order compatibility for slacked."
+    )
+    print(
         "'feasible' / 'SOSC' are the share of accepted samples inside the analytic "
         "feasible set / satisfying the second-order sufficient conditions (from the "
         "primary run only)."
+    )
+    print(
+        "For the rollout methods, acceptance rate is successful seed solves / "
+        "seed attempts; rollout MPC steps are excluded."
     )
 
 
@@ -2132,12 +2455,32 @@ def save_paper_table(
                 "label",
                 "requested",
                 "accepted",
+                "reference_solutions",
+                "samples_per_reference",
+                "preprojection_optimality_criterion",
+                "preprojection_optimality_passed",
+                "preprojection_optimality_evaluated",
+                "preprojection_optimality_pct",
                 "feasible_pct",
                 "sosc_pct",
                 "acceptance_rate_mean_pct",
                 "acceptance_rate_std_pct",
                 "seconds_per_sample_mean_ms",
                 "seconds_per_sample_std_ms",
+                "total_time_mean_s",
+                "total_time_std_s",
+                "active_set_exploration_time_mean_s",
+                "active_set_exploration_time_std_s",
+                "rollout_time_mean_s",
+                "rollout_time_std_s",
+                "reference_generation_time_mean_s",
+                "reference_generation_time_std_s",
+                "nonlinear_projection_time_mean_s",
+                "nonlinear_projection_time_std_s",
+                "boundary_lp_time_mean_s",
+                "boundary_lp_time_std_s",
+                "other_pipeline_time_mean_s",
+                "other_pipeline_time_std_s",
                 "repeats",
             ]
         )
@@ -2150,18 +2493,42 @@ def save_paper_table(
             sosc_pct = (
                 100.0 * result.locally_optimal / result.accepted if result.accepted else float("nan")
             )
+            pre_criterion, pre_passed, pre_evaluated = preprojection_optimality(result)
             writer.writerow(
                 [
                     result.method,
                     LABELS[result.method],
                     requested,
                     result.accepted,
+                    result.reference_solutions,
+                    result.samples_per_reference,
+                    pre_criterion,
+                    pre_passed,
+                    pre_evaluated,
+                    (
+                        100.0 * pre_passed / pre_evaluated
+                        if pre_evaluated else float("nan")
+                    ),
                     feasible_pct,
                     sosc_pct,
                     100.0 * accept["mean"],
                     100.0 * accept["std"],
                     1000.0 * timing["mean"],
                     1000.0 * timing["std"],
+                    stats[result.method]["elapsed_s"]["mean"],
+                    stats[result.method]["elapsed_s"]["std"],
+                    stats[result.method]["generation_s"]["mean"],
+                    stats[result.method]["generation_s"]["std"],
+                    stats[result.method]["post_processing_s"]["mean"],
+                    stats[result.method]["post_processing_s"]["std"],
+                    stats[result.method]["reference_generation_time_s"]["mean"],
+                    stats[result.method]["reference_generation_time_s"]["std"],
+                    stats[result.method]["nonlinear_projection_time_s"]["mean"],
+                    stats[result.method]["nonlinear_projection_time_s"]["std"],
+                    stats[result.method]["boundary_lp_time_s"]["mean"],
+                    stats[result.method]["boundary_lp_time_s"]["std"],
+                    stats[result.method]["other_pipeline_time_s"]["mean"],
+                    stats[result.method]["other_pipeline_time_s"]["std"],
                     repeats,
                 ]
             )

@@ -3,9 +3,10 @@
 # CasADi must be a build that exposes the solver plugins used by the models:
 #   * ipopt    -- nonlinear MPC, seed problems, slacked/projection problems
 #   * qpoases  -- linear programs of the linearized Hit-and-Run chain
-#   * ccopt    -- complementarity relaxation used by the bilevel active-set sampler
-# The stock PyPI wheel ships ipopt and qpoases but NOT ccopt, so the bilevel
-# samplers need the custom CasADi build (see README, "CasADi and solver plugins").
+#   * ccopt    -- optional native complementarity solver for the bilevel sampler
+# The stock PyPI wheel ships ipopt and qpoases but NOT ccopt. Bilevel sampling
+# can use the stock wheel via the Scholtes/IPOPT option; the default ccopt path
+# needs the custom CasADi build (see README, "CasADi and solver plugins").
 # casadi==3.7.2
 contourpy==1.3.3
 csnn==1.0.6.post3

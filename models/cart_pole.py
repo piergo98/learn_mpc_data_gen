@@ -8,6 +8,18 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Rectangle
 from scipy.linalg import solve_discrete_are, solve_continuous_are, null_space
 
+try:
+    from .scholtes_homotopy import ScholtesHomotopySolver
+except ImportError:  # Support running this file directly from the repository.
+    from scholtes_homotopy import ScholtesHomotopySolver
+
+
+# IPOPT and LP solvers can return nominal points a few ulps outside an active
+# bound. Use one shared tolerance when transferring those points to the
+# condensed Hit-and-Run LP.
+BOUNDARY_LP_FEASIBILITY_TOL = 1e-7
+
+
 # Class implementing the cart-pole environment
 class CartPole:
     def __init__(self, N, dt=0.05, dt_mpc=None, dt_sim=None, sym_type='SX'):
@@ -574,20 +586,65 @@ class CartPole:
 
         return fig, axes
     
-    def bilevel_active_set(self, x_max, slack_penalty="quadratic", return_solver=False):
+    def bilevel_active_set(
+        self,
+        x_max,
+        slack_penalty="quadratic",
+        return_solver=False,
+        complementarity_method="ccopt",
+        scholtes_relaxations=(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6),
+    ):
         """
         Bilevel active-set method for finding a feasible initial state for the MPC problem.
-        By construction, the returned state is guaranteed to be optimally feasible for the MPC problem.
+
+        ``complementarity_method`` selects either the native ``"ccopt"``
+        complementarity solver or a ``"scholtes"`` relaxation homotopy solved
+        with IPOPT.  ``scholtes_relaxations`` must be a strictly decreasing
+        sequence of positive relaxation parameters. Solver bundles requested
+        with ``return_solver=True`` are cached on this model instance.
         """
         slack_penalty = str(slack_penalty).lower()
         if slack_penalty not in {"l1", "quadratic"}:
             raise ValueError("slack_penalty must be either 'l1' or 'quadratic'.")
+        complementarity_method = str(complementarity_method).lower().replace("-", "_")
+        if complementarity_method == "scholtes_ipopt":
+            complementarity_method = "scholtes"
+        if complementarity_method not in {"ccopt", "scholtes"}:
+            raise ValueError(
+                "complementarity_method must be either 'ccopt' or 'scholtes'."
+            )
+
+        # Solver construction is expensive and its symbolic structure depends
+        # only on these settings. Keep the cache local to this model instance,
+        # so solvers are never shared across horizons or CartPole objects.
+        effective_x_max = (
+            np.array(
+                [self.p_bound, self.v_bound, self.theta_bound, self.omega_bound],
+                dtype=float,
+            )
+            if x_max is None
+            else np.asarray(x_max, dtype=float)
+        )
+        cache_key = (
+            slack_penalty,
+            complementarity_method,
+            tuple(float(value) for value in scholtes_relaxations),
+            tuple(effective_x_max.reshape(-1)),
+        )
+        solver_cache = getattr(self, "_bilevel_solver_cache", None)
+        if solver_cache is None:
+            solver_cache = {}
+            self._bilevel_solver_cache = solver_cache
+        if return_solver and cache_key in solver_cache:
+            self._last_bilevel_solver_cache_hit = True
+            return solver_cache[cache_key]
+        self._last_bilevel_solver_cache_hit = False
 
         def weighted_slack_cost(slacks, weights):
             regularization = 1e-6 * ca.dot(slacks, slacks)
             if slack_penalty == "l1":
-                return ca.dot(ca.DM(weights), slacks)
-            return 0.5 * slacks.T @ np.diag(weights) @ slacks
+                return ca.dot(weights, slacks)
+            return 0.5 * slacks.T @ ca.diag(weights) @ slacks
 
         x = ca.SX.sym('x', 4)
         u = ca.SX.sym('u', 1)
@@ -709,7 +766,7 @@ class CartPole:
                 min_spikes=1,
                 max_spikes=1,
                 base_scale=1e-6,
-                spike_factor_range=(1e6, 1e8),
+                spike_factor_range=(1e0, 1e2),
                 spike_probability=0.6,
             )
         if return_solver:
@@ -741,52 +798,96 @@ class CartPole:
         lbg += [0.0] * stationarity.shape[0]
         ubg += [0.0] * stationarity.shape[0]
         
-        # Create the NLP problem
+        # Parameters exposed to callers.  The Scholtes relaxation parameter is
+        # appended privately by ScholtesHomotopySolver below.
         if return_solver:
-            params = ca.vertcat(x0, rho_param)
-            nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': params}
+            user_params = ca.vertcat(x0, rho_param)
         else:
-            nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p':x0}
+            user_params = x0
             
         varvar = 0
 
         if len(slack_indices) != lam_g.numel():
             raise RuntimeError("One residual is required per inequality multiplier.")
 
-        ind_cc = [
-            [lam_g_start + i, slack_indices[i]]
-            for i in range(lam_g.numel())
-        ]
-        cctypes = [varvar] * lam_g.numel()
-            
-        
         # Create the NLP solver
-        print("Creating NLP solver...")
-        opts = {
-            "expand": False,
-            "print_time": False,
-            # ccopt delegates NLP solves to MadNLP; bound_relax_factor=0.0 is
-            # important for complementarity formulations.
-            "cc_pairs": ind_cc,
-            "cc_types": cctypes,
-            "madnlp.print_level": 6,
-            "madnlp.max_iter": 5000,
-            "madnlp.tol": 1e-6,
-            "madnlp.bound_relax_factor": 0.0,
-            "madnlp.linear_solver": "Ma97Solver",
-            "ccopt.relaxation_update.TYPE": "RolloffRelaxationUpdate",
-            "ccopt.relaxation_update.rolloff_point": 1e-3,
-            "ccopt.relaxation_update.rolloff_slope": 1.5,
-            "ccopt.relaxation_update.sigma_min": 1e-6,
-        }
-        bilevel_solver = ca.nlpsol("bilevel_solver", "ccopt", nlp, opts)
+        print(f"Creating {complementarity_method} bilevel NLP solver...")
+        if complementarity_method == "ccopt":
+            ind_cc = [
+                [lam_g_start + i, slack_indices[i]]
+                for i in range(lam_g.numel())
+            ]
+            cctypes = [varvar] * lam_g.numel()
+            nlp = {
+                'f': J,
+                'x': ca.vertcat(*w),
+                'g': ca.vertcat(*g),
+                'p': user_params,
+            }
+            opts = {
+                "expand": False,
+                "print_time": False,
+                # ccopt delegates NLP solves to MadNLP; bound_relax_factor=0.0 is
+                # important for complementarity formulations.
+                "cc_pairs": ind_cc,
+                "cc_types": cctypes,
+                "madnlp.print_level": 6,
+                "madnlp.max_iter": 2000,
+                "madnlp.tol": 1e-6,
+                "madnlp.bound_relax_factor": 0.0,
+                "madnlp.linear_solver": "Ma97Solver",
+                "ccopt.relaxation_update.TYPE": "RolloffRelaxationUpdate",
+                "ccopt.relaxation_update.rolloff_point": 1e-3,
+                "ccopt.relaxation_update.rolloff_slope": 1.5,
+                "ccopt.relaxation_update.sigma_min": 1e-6,
+            }
+            bilevel_solver = ca.nlpsol("bilevel_solver", "ccopt", nlp, opts)
+        else:
+            relaxation = ca.SX.sym("scholtes_relaxation")
+            complementarity_products = lam_g * ca.vertcat(*slacks)
+            g += [complementarity_products - relaxation]
+            lbg += [-ca.inf] * lam_g.numel()
+            ubg += [0.0] * lam_g.numel()
+            nlp = {
+                'f': J,
+                'x': ca.vertcat(*w),
+                'g': ca.vertcat(*g),
+                'p': ca.vertcat(user_params, relaxation),
+            }
+            opts = {
+                "expand": False,
+                "print_time": False,
+                "ipopt.print_level": 0,
+                "ipopt.max_iter": 5000,
+                "ipopt.tol": 1e-8,
+                "ipopt.acceptable_tol": 1e-6,
+            }
+            ipopt_solver = ca.nlpsol(
+                "bilevel_scholtes_solver", "ipopt", nlp, opts
+            )
+            bilevel_solver = ScholtesHomotopySolver(
+                ipopt_solver, user_params.numel(), scholtes_relaxations
+            )
         
         mpc_vars = ca.Function('mpc_vars', [ca.vertcat(*w)], [ca.vertcat(*w_mpc)])
         lambda_vars = ca.Function('lambda_vars', [ca.vertcat(*w)], [lam_h, lam_g])
         slack_vars = ca.Function('slack_vars', [ca.vertcat(*w)], [ca.vertcat(*slacks)])
         
         if return_solver:
-            return bilevel_solver, w0, lbw, ubw, lbg, ubg, slack_block_sizes, mpc_vars, lambda_vars, slack_vars
+            solver_bundle = (
+                bilevel_solver,
+                w0,
+                lbw,
+                ubw,
+                lbg,
+                ubg,
+                slack_block_sizes,
+                mpc_vars,
+                lambda_vars,
+                slack_vars,
+            )
+            solver_cache[cache_key] = solver_bundle
+            return solver_bundle
         
         # Solve the bilevel problem
         print("Solving bilevel problem...")
@@ -822,10 +923,15 @@ class CartPole:
         plot_results=False,
         return_u_seq=False,
         slack_penalty="quadratic",
-        print_constraint_jacobian=False,
+        print_stationarity_perturbation=False,
         return_traj=False,
     ):
-        """Find an initial state that yields a feasible optimal solution for the MPC problem.
+        """Find a feasible initial state with the paper's slacked auxiliary NLP.
+
+        The returned trajectory is feasible for the original MPC constraints.
+        It is generally stationary for the perturbed objective characterized in
+        the paper, and is stationary for the original objective only when the
+        reported perturbation vanishes.
 
         Parameters
         ----------
@@ -835,33 +941,39 @@ class CartPole:
             Maximum absolute values for the state components. If None, defaults to
             ``[self.p_bound, self.v_bound, self.theta_bound, self.omega_bound]``.
         close_to_bounds : bool, optional
-            If True, the initial state is constrained to be close to the bounds. 
-            If False, the initial state is not constrained to be close to the bounds.
+            If True, both state and input inequalities may receive positive
+            sampled activity weights. If False, only input inequalities are
+            targeted. All residual equations remain exact in either case.
         u0_active_bound : bool, optional
-            If True, the first control input is constrained to be at its bound.
-            If False, the first control input is not constrained to be at its bound.
+            If True, one side of the first-input bound is always included in
+            the sampled target set (it is penalized, not imposed as an equality).
         plot_results : bool, optional
             If True, plots the initial state and first control input.
         return_u_seq : bool, optional
             If True, returns the full control sequence from the MPC solution.
         return_traj : bool, optional
             If True, returns the full state and control trajectories from the MPC solution.
-        slack_penalty : {"l1", "quadratic"}, optional
-            Norm used for the randomly weighted state and input residual
-            slacks. ``"l1"`` preserves the historical behavior. Both choices
-            include a tiny quadratic regularizer for numerical conditioning.
-        print_constraint_jacobian : bool, optional
-            If True, prints if the initial state is also optimal for the MPC problem by checking the KKT conditions.
+        slack_penalty : {"quadratic"}, optional
+            Kept as an explicit argument for API compatibility. The paper's
+            objective is exactly ``0.5 * s.T @ Q @ s``; L1 is rejected.
+        print_stationarity_perturbation : bool, optional
+            If True, display c* and whether its relative residual is within the
+            numerical zero tolerance.
         """
         slack_penalty = str(slack_penalty).lower()
-        if slack_penalty not in {"l1", "quadratic"}:
-            raise ValueError("slack_penalty must be either 'l1' or 'quadratic'.")
+        if slack_penalty != "quadratic":
+            raise ValueError(
+                "The paper-compliant slacked formulation only supports "
+                "slack_penalty='quadratic'."
+            )
 
         def weighted_slack_cost(slacks, weights):
-            regularization = 1e-6 * ca.dot(slacks, slacks)
-            if slack_penalty == "l1":
-                return ca.dot(ca.DM(weights), slacks)
-            return slacks.T @ np.diag(weights) @ slacks
+            # Exactly 1/2 ||s||_Q^2, so its slack gradient is Qs as in the
+            # derivation in the paper (with no unreported regularizer).
+            return 0.5 * ca.dot(ca.DM(weights), slacks**2)
+
+        if N < 1:
+            raise ValueError("N must be at least 1.")
 
         x = ca.SX.sym('x', 4)
         u = ca.SX.sym('u', 1)
@@ -883,14 +995,22 @@ class CartPole:
         ubg = []
         J = 0
 
+        state_bounds = np.array(
+            [self.p_bound, self.v_bound, self.theta_bound, self.omega_bound],
+            dtype=float,
+        )
         if x_max is None:
-            x_max = np.array([self.p_bound, self.v_bound, self.theta_bound, self.omega_bound], dtype=float)
+            x_max = state_bounds.copy()
         else:
             x_max = np.asarray(x_max, dtype=float)
             if x_max.shape != (4,):
                 raise ValueError("x_max must have shape (4,).")
+            if np.any(~np.isfinite(x_max)) or np.any(x_max <= 0.0):
+                raise ValueError("x_max must contain positive finite values.")
+            if np.any(x_max > state_bounds + 1e-12):
+                raise ValueError("x_max cannot exceed the original MPC state bounds.")
 
-        x_min = -x_max
+        state_min = -state_bounds
         u_max = np.array([self.u_bound], dtype=float)
         u_min = -u_max
 
@@ -901,30 +1021,28 @@ class CartPole:
         w0 += [0.0, 0.0, np.pi, 0.0]
         w_mpc += [Xk]
         
-        # s_x0 = ca.SX.sym('slack_x0', 4, 2)
-        # s_x0_var = ca.vec(s_x0)
-        # w += [s_x0_var]
-        # lbw += [0.0 for _ in range(8)]
-        # ubw += [ca.inf for _ in range(8)]
-        # w0 += [0.0 for _ in range(8)]
-
-        # if close_to_bounds:
-        #     constraints += [Xk - x_max + s_x0[:, 0], -Xk + x_min + s_x0[:, 1]]
-        #     lbg += [0.0 for _ in range(8)]
-        #     ubg += [0.0 for _ in range(8)]
-        # else:
-        #     constraints += [Xk - x_max + s_x0[:, 0], -Xk + x_min + s_x0[:, 1]]
-        #     lbg += [-ca.inf for _ in range(8)]
-        #     ubg += [0.0 for _ in range(8)]
+        # x0 is free in the auxiliary problem, but its original state-bound
+        # inequalities remain in g(w) and therefore require slacks too.
+        s_x0 = ca.SX.sym('slack_x0', 4, 2)
+        s_x0_var = ca.vec(s_x0)
+        w += [s_x0_var]
+        lbw += [0.0 for _ in range(8)]
+        ubw += [ca.inf for _ in range(8)]
+        w0 += [0.0 for _ in range(8)]
+        constraints += [
+            Xk - state_bounds + s_x0[:, 0],
+            -Xk + state_min + s_x0[:, 1],
+        ]
+        lbg += [0.0 for _ in range(8)]
+        ubg += [0.0 for _ in range(8)]
 
         X_syms = [Xk]
         U_syms = []
-        # x_slacks = [s_x0_var]
-        x_slacks = []
+        x_slacks = [s_x0_var]
         u_slacks = []
         # Each residual block stores upper residuals first, then lower residuals.
         # Keep the block sizes so random spiking can choose at most one side per bound.
-        x_slack_block_sizes = []
+        x_slack_block_sizes = [4]
         u_slack_block_sizes = []
 
         for k in range(N):
@@ -962,13 +1080,13 @@ class CartPole:
             ubw += [ca.inf for _ in range(8)]
             w0 += [0.0 for _ in range(8)]
 
-            constraints += [Xk - x_max + s_xk[:, 0], -Xk + x_min + s_xk[:, 1]]
-            if close_to_bounds:
-                lbg += [0.0 for _ in range(8)]
-                ubg += [0.0 for _ in range(8)]
-            else:
-                lbg += [-ca.inf for _ in range(8)]
-                ubg += [0.0 for _ in range(8)]
+            constraints += [
+                Xk - state_bounds + s_xk[:, 0],
+                -Xk + state_min + s_xk[:, 1],
+            ]
+            # The paper requires g(w) + s = 0 for every inequality residual.
+            lbg += [0.0 for _ in range(8)]
+            ubg += [0.0 for _ in range(8)]
 
             constraints += [Xk_next - Xk]
             lbg += [0.0 for _ in range(4)]
@@ -991,35 +1109,66 @@ class CartPole:
         # ubg += [alpha]
 
         x_slacks_vec = ca.vertcat(*x_slacks)
-        if close_to_bounds:
-            rho_x, _ = self.spiky_residual_weights(
-                x_slack_block_sizes,
-                min_spikes=1,
-                max_spikes=1,
-                base_scale=1e-6,
-                spike_factor_range=(1e6, 1e8),
-                spike_probability=1.0,
+        u_slacks_vec = ca.vertcat(*u_slacks)
+
+        # Q has positive entries only for the sampled target set T.  Sampling
+        # at most n_w - m_h targets enforces m_h + |T| <= n_w.
+        block_sizes = x_slack_block_sizes + u_slack_block_sizes
+        residual_pairs = []
+        offset = 0
+        for block_size in block_sizes:
+            for component in range(block_size):
+                residual_pairs.append(
+                    (offset + component, offset + block_size + component)
+                )
+            offset += 2 * block_size
+
+        n_state_pairs = sum(x_slack_block_sizes)
+        eligible_pairs = np.arange(len(residual_pairs), dtype=int)
+        if not close_to_bounds:
+            # Retain the historical option's intent: target only input bounds.
+            eligible_pairs = eligible_pairs[n_state_pairs:]
+
+        n_w = 4 * (N + 1) + N
+        m_h = 4 * N
+        max_targets = min(n_w - m_h, eligible_pairs.size)
+        if max_targets < 1:
+            raise RuntimeError("No inequality constraints are available for targeting.")
+
+        forced_pair = n_state_pairs if u0_active_bound else None
+        if forced_pair is not None and forced_pair not in eligible_pairs:
+            eligible_pairs = np.append(eligible_pairs, forced_pair)
+            max_targets = min(n_w - m_h, eligible_pairs.size)
+
+        num_targets = np.random.randint(1, max_targets + 1)
+        if forced_pair is None:
+            target_pairs = np.random.choice(
+                eligible_pairs, size=num_targets, replace=False
             )
         else:
-            rho_x = np.full(x_slacks_vec.numel(), 1e-6, dtype=float)
-            
-        J += weighted_slack_cost(x_slacks_vec, rho_x)
-        
-        u_slacks_vec = ca.vertcat(*u_slacks)
-        rho_u, _ = self.spiky_residual_weights(
-            u_slack_block_sizes,
-            min_spikes=1,
-            max_spikes=1,
-            base_scale=1e-6,
-            spike_factor_range=(1e6, 1e8),
-            spike_probability=1.0,
+            remaining = eligible_pairs[eligible_pairs != forced_pair]
+            extra_count = num_targets - 1
+            extras = np.random.choice(remaining, size=extra_count, replace=False)
+            target_pairs = np.r_[forced_pair, extras]
+
+        rho = np.zeros(2 * sum(block_sizes), dtype=float)
+        target_residuals = np.array(
+            [residual_pairs[pair][np.random.randint(2)] for pair in target_pairs],
+            dtype=int,
         )
-        
-        # print(f"rho_u = {rho_u}")
+        rho[target_residuals] = 10.0 ** np.random.uniform(
+            0.0, 2.0, size=target_residuals.size
+        )
+        rho_x = rho[:x_slacks_vec.numel()]
+        rho_u = rho[x_slacks_vec.numel():]
+        J += weighted_slack_cost(x_slacks_vec, rho_x)
         J += weighted_slack_cost(u_slacks_vec, rho_u)
-            
-        # Concatenate all slack weights into a diagonal matrix
-        rho = np.concatenate([rho_x, rho_u])
+        self.last_slacked_problem_stats = {
+            "n_w": int(n_w),
+            "m_h": int(m_h),
+            "target_count": int(target_residuals.size),
+            "target_indices": target_residuals.copy(),
+        }
         
         X_stack = ca.hcat(X_syms)
         U_stack = ca.hcat(U_syms)
@@ -1075,8 +1224,51 @@ class CartPole:
         all_decision_indices = np.arange(x_dec.numel())
         w_mpc_opt = ca.Function("w_mpc_opt", [x_dec], [ca.vertcat(*w_mpc)])
         w_mpc_solution = w_mpc_opt(sol['x']).full().flatten()
+
+        # Evaluate c* for every solve so batch statistics do not depend on
+        # whether verbose perturbation printing was requested.
+        slack_values = np.asarray(opt_slacks.full(), dtype=float).reshape(-1)
+        inactive_slack_values = np.where(
+            np.abs(slack_values) > 1e-8, slack_values, 0.0
+        )
+        constraint_jacobian_at_opt = slacked_constraint_jacobian(
+            sol['x']
+        ).full()
+        constraint_rows = []
+        for dec_idx in slack_decision_indices:
+            rows = np.flatnonzero(
+                np.abs(constraint_jacobian_at_opt[:, dec_idx]) > 1e-12
+            )
+            if rows.size != 1:
+                raise RuntimeError(
+                    f"Slack decision variable {dec_idx} appears in constraint rows {rows}"
+                )
+            constraint_rows.append(rows[0])
+        constraint_rows = np.asarray(constraint_rows, dtype=int)
+        slack_and_x0_indices = np.concatenate(
+            [np.arange(4), slack_decision_indices]
+        )
+        y_decision_indices = np.setdiff1d(
+            all_decision_indices, slack_and_x0_indices
+        )
+        g_jacobian_y = constraint_jacobian_at_opt[
+            np.ix_(constraint_rows, y_decision_indices)
+        ].T
+        weighted_inactive_slacks = rho * inactive_slack_values
+        c_star = -(g_jacobian_y @ weighted_inactive_slacks)
+        c_star_norm = float(np.linalg.norm(c_star))
+        c_star_scale = (
+            np.linalg.norm(g_jacobian_y, ord=np.inf)
+            * np.linalg.norm(weighted_inactive_slacks, ord=np.inf)
+        )
+        c_star_relative_residual = c_star_norm / max(1.0, c_star_scale)
+        self.last_slacked_c_star = np.asarray(c_star, dtype=float).reshape(-1)
+        self.last_slacked_c_star_norm = c_star_norm
+        self.last_slacked_c_star_is_zero = bool(
+            c_star_relative_residual <= 1e-6
+        )
         
-        if print_constraint_jacobian:
+        if print_stationarity_perturbation:
             # From opt slacks, extract the weights of the nonzero slacks
             tol = 1e-8
 
@@ -1143,32 +1335,17 @@ class CartPole:
             
             # Evaluate the following optimality condition
             condition_residual = g_jacobian_y_I @ Q_I @ s_I
-            
-            absolute_error = np.linalg.norm(condition_residual)
 
-            scale = (
-                np.linalg.norm(g_jacobian_y_I, ord=np.inf)
-                * np.linalg.norm(Q_I @ s_I, ord=np.inf)
-            )
-            relative_error = absolute_error / max(1.0, scale)
-
-            holds = relative_error <= 1e-6
-
-            # print("Active slack indices:", nonzero_slack_indices)
-            # print("nonzero slack values:", s_I)
-            # print("nonzero slack weights:", rho_I)
-            # print("Associated constraint rows:", constraint_row_I)
-            # print("Condition residual:", condition_residual)
-            print("Absolute error:", absolute_error)
-            # print("Relative error:", relative_error)
-            print("Condition holds:", holds)
+            print("c*:", self.last_slacked_c_star)
+            print("||c*||:", self.last_slacked_c_star_norm)
+            print("c* numerically zero:", self.last_slacked_c_star_is_zero)
             
             # Check if the g_jacobian_y_I matrix is full column rank
-            if np.linalg.matrix_rank(g_jacobian_y_I) < g_jacobian_y_I.shape[1]:
-                print("g_jacobian_y_I is not full column rank.")
+            # if np.linalg.matrix_rank(g_jacobian_y_I) < g_jacobian_y_I.shape[1]:
+            #     print("g_jacobian_y_I is not full column rank.")
 
-            if np.linalg.matrix_rank(g_jacobian_y_I @ Q_I) < g_jacobian_y_I.shape[1]:
-                print("g_jacobian_y_I @ Q_I is not full column rank.")
+            # if np.linalg.matrix_rank(g_jacobian_y_I @ Q_I) < g_jacobian_y_I.shape[1]:
+            #     print("g_jacobian_y_I @ Q_I is not full column rank.")
 
         if plot_results:
             x_pred = np.array(X_opt.full())
@@ -1367,6 +1544,15 @@ class CartPole:
             h_x_block - Hx_block @ nominal_states,
             h_u_block - Hu_block @ nominal_inputs,
         ])
+        min_nominal_margin = float(np.min(b))
+        if min_nominal_margin < -BOUNDARY_LP_FEASIBILITY_TOL:
+            raise RuntimeError(
+                "The nominal trajectory is not feasible for its linearized "
+                f"OCP: minimum state/input margin is {min_nominal_margin:.3e}."
+            )
+        # Preserve the construction guarantee at active bounds when the NLP
+        # solution is only outside by solver-scale numerical noise.
+        b = np.maximum(b, 0.0)
 
         return {
             "G": G,
@@ -1396,40 +1582,63 @@ class CartPole:
         """
         G = np.asarray(linear_ocp["G"], dtype=float)
         F = np.asarray(linear_ocp["F"], dtype=float)
-        b = np.asarray(linear_ocp["b"], dtype=float)
-        
-        dx0 = np.asarray(dx0, dtype=float).reshape(4)
-        direction = np.asarray(direction, dtype=float).reshape(-1)
-        initial_state_bounds = np.asarray(initial_state_bounds, dtype=float).reshape(4)
-        
-        # Check dimensions of the linearized OCP matrices
-        n_x = 4
-        n_u = 1
-        assert G.shape[1] == n_u * self.N, f"G has {G.shape[1]} columns, expected {n_u * self.N}"
-        assert F.shape[1] == n_x, (
-            f"F has {F.shape[1]} columns, expected {n_x}"
-        )
-        
-        # Decision vector is [du_0, ..., du_{N-1}, alpha].
-        # F(dx0 + alpha*direction) + G*du <= b, hence
-        # [G, F*direction] [du; alpha] <= b - F*dx0.
-        A = np.hstack([G, F @ direction.reshape(-1, 1)])
-        uba = b - F @ dx0
+        b = np.asarray(linear_ocp["b"], dtype=float).reshape(-1)
 
-        # Keep the initial state inside the requested sampling box as well:
-        # -bounds <= x0_nominal + dx0 + alpha*direction <= bounds.
-        seed = np.asarray(linear_ocp["X_nominal"], dtype=float)[:, 0]
-        zero_controls = np.zeros((n_x, G.shape[1]))
-        initial_state_A = np.vstack([
-            np.hstack([zero_controls, direction.reshape(-1, 1)]),
-            np.hstack([zero_controls, -direction.reshape(-1, 1)]),
+        dx0 = np.asarray(dx0, dtype=float).reshape(-1)
+        direction = np.asarray(direction, dtype=float).reshape(-1)
+        initial_state_bounds = np.asarray(
+            initial_state_bounds,
+            dtype=float,
+        ).reshape(-1)
+
+        assert dx0.size == 4
+        assert direction.size == 4
+        assert initial_state_bounds.size == 4
+
+        seed = np.asarray(
+            linear_ocp["X_nominal"],
+            dtype=float,
+        )[:, 0].reshape(-1)
+
+        Fd = F @ direction
+        rhs_ocp = b - F @ dx0 + BOUNDARY_LP_FEASIBILITY_TOL
+
+        assert rhs_ocp.shape == (G.shape[0],)
+        assert Fd.shape == (G.shape[0],)
+
+        A_ocp = np.column_stack([
+            G,
+            Fd,
         ])
-        initial_state_uba = np.hstack([
+
+        zero_controls = np.zeros((4, G.shape[1]))
+
+        A_box = np.vstack([
+            np.column_stack([
+                zero_controls,
+                direction,
+            ]),
+            np.column_stack([
+                zero_controls,
+                -direction,
+            ]),
+        ])
+
+        uba_box = np.concatenate([
             initial_state_bounds - seed - dx0,
             initial_state_bounds + seed + dx0,
+        ]) + BOUNDARY_LP_FEASIBILITY_TOL
+
+        A = np.vstack([
+            A_ocp,
+            A_box,
         ])
-        A = np.vstack([A, initial_state_A])
-        uba = np.hstack([uba, initial_state_uba])
+
+        uba = np.concatenate([
+            rhs_ocp,
+            uba_box,
+        ])
+
         lba = np.full(A.shape[0], -np.inf)
         # The decision vector is [du, alpha], so the number of variables is n_du + 1.
         n_variables = A.shape[1]
@@ -1451,16 +1660,40 @@ class CartPole:
                 "a": ca.Sparsity.dense(n_constraints, n_variables),
             }
             options = {
-                "printLevel": "none",
                 "print_time": False,
                 "error_on_fail": False,
+                # Solve the LP through IPOPT rather than qpOASES: the "nlpsol"
+                # conic plugin casts the QP/LP as a (trivial) NLP and hands it
+                # to the named nlpsol solver.
+                # "nlpsol": "ipopt",
+                # "nlpsol_options": {
+                #     "print_time": False,
+                #     "ipopt.print_level": 0,
+                #     "ipopt.hessian_constant": "yes",
+                #     "ipopt.least_square_init_primal": "yes",
+                #     "ipopt.least_square_init_duals": "yes",
+                #     "ipopt.mehrotra_algorithm": "yes",
+                #     "ipopt.grad_f_constant": "yes",
+                #     "ipopt.jac_c_constant": "yes",
+                #     "ipopt.jac_d_constant": "yes",
+                #     "ipopt.max_iter": 100,
+                # },
+                # "nlpsol": "qpoases",
+                # "nlpsol_options": {
+                #     "print_time": False,
+                #     "qpoases.printLevel": "none",
+                # },
+                "highs": {
+                    "output_flag": False,  # HiGHS output
+                    "log_to_console": False,
+                }
             }
             solver = ca.conic(
                 (
                     f"linearized_boundary_{id(self)}_"
                     f"{n_constraints}_{n_variables}"
                 ),
-                "qpoases",
+                "highs",
                 lp_structure,
                 options,
             )
@@ -1486,15 +1719,24 @@ class CartPole:
         except RuntimeError:
             raise RuntimeError("The linearized boundary LP failed to solve.")
 
-        if not solver.stats().get("success", False):
+        stats = solver.stats()
+
+        if not stats.get("success", False):
+            print("HiGHS failure")
+            print("return_status:", stats.get("return_status"))
+            print("unified_return_status:", stats.get("unified_return_status"))
             return None
 
         solution = result["x"].full().reshape(-1)
         alpha = float(solution[-1])
         if not np.isfinite(alpha):
             return None
-
-        return alpha
+        # IPOPT can violate the alpha >= 0 bound by a small feasibility
+        # tolerance. Clamp only that numerical residue; a material violation
+        # means this direction is not a valid Hit-and-Run chord.
+        if alpha < -1e-8:
+            return None
+        return max(alpha, 0.0)
 
     def _build_feasible_projection_problem(self):
         """Build the weighted, cost-aware nonlinear projection problem.
@@ -1540,7 +1782,11 @@ class CartPole:
         }
         opts = {
             "print_time": False,
-            "ipopt": {"print_level": 0, "max_iter": 2000, "tol": 1e-8},
+            "expand": True,
+            "ipopt": {"print_level": 0, 
+                      "max_iter": 1000, 
+                      "tol": 1e-6,
+                      "mu_strategy": "adaptive",},
         }
         solver = ca.nlpsol("feasible_projection_solver", "ipopt", problem, opts)
         n_equalities = int(h_tilde.numel())
@@ -1871,25 +2117,27 @@ class CartPole:
         num_samples=100,
         num_feasible_seeds=5,
         max_seed_attempts=1000,
-        # burn_in=10,
-        # thinning=1,
         projection_Qx=None,
         project_infeasible=True,
         use_bilevel=False,
+        reference_method=None,
+        slack_penalty="quadratic",
+        close_to_bounds=True,
         random_seed=None,
         x_max=None,
         plot_results=True,
         plot_3d=False,
         show=True,
+        warm_start=True,
     ):
         """Collect nonlinear-feasible states with local LMPC Hit-and-Run.
 
-        Feasible seeds are first obtained by uniform rejection sampling. Each
-        seed's nonlinear optimal trajectory defines a time-varying affine OCP.
-        Hit-and-Run boundary LPs then follow Algorithm 1 of Milios et al.
-        (2026). Every proposed state is checked against the nonlinear MPC and,
-        when requested, infeasible proposals are locally projected onto its
-        feasible set by Euclidean-distance minimization.
+        Reference solutions are obtained by ``reference_method``. Each
+        reference trajectory defines a time-varying affine OCP. Bounded
+        Hit-and-Run then generates exactly ``num_samples / num_feasible_seeds``
+        candidates per reference. Every candidate is used as the target of the
+        nonlinear projection problem; the projection solution supplies both
+        the returned feasible state and its locally optimal NMPC trajectory.
 
         See https://arxiv.org/abs/2604.09118 for the linear MPC boundary LP.
         
@@ -1898,9 +2146,16 @@ class CartPole:
             num_feasible_seeds (int): Number of independent nonlinear-feasible seeds to use.
             max_seed_attempts (int): Maximum uniform draws to find feasible seeds.
             projection_Qx (scalar, vector, or matrix): Optional positive-semidefinite weight for the Euclidean-distance projection. 
-            use_bilevel (bool): If True, use the bilevel projection method for seeds generation. If False, use the random sampling method.
+            project_infeasible (bool): Deprecated compatibility flag. It must
+                remain True because every candidate is projected.
+            use_bilevel (bool): Legacy alias selecting bilevel references when
+                ``reference_method`` is not supplied.
+            reference_method (str or None): ``"bilevel"``, ``"slacked"``, or
+                ``"uniform"`` reference generation.
             If None, the identity is used.
             random_seed (int or None): Optional seed for the random number generator.
+            warm_start (bool): Reuse the previous successful bilevel solution
+                and the previous projected trajectory in each Hit-and-Run chain.
             x_max (array-like or None): Optional 4-element array of positive state bounds for the Hit-and-Run LPs. 
             If None, the nonlinear MPC bounds are used.
             plot_results (bool): If True, plot the collected samples and seeds.
@@ -1915,11 +2170,16 @@ class CartPole:
             raise ValueError("num_feasible_seeds must be positive.")
         if max_seed_attempts <= 0:
             raise ValueError("max_seed_attempts must be positive.")
-        # if burn_in < 0 or thinning <= 0:
-        #     raise ValueError("burn_in must be non-negative and thinning must be positive.")
+        if not project_infeasible:
+            raise ValueError(
+                "The paper-compliant pipeline projects every linearized candidate; "
+                "project_infeasible=False is no longer supported."
+            )
         if num_samples == 0:
             self.last_linearized_sampling_stats = {"requested_samples": 0, "returned_samples": 0}
             return np.empty((0, 4))
+        if num_feasible_seeds > num_samples:
+            raise ValueError("num_feasible_seeds cannot exceed num_samples.")
         
         # The projection weight is validated here, but not used until the nonlinear projection step
         Qx = self._validate_projection_weight(projection_Qx)
@@ -1932,19 +2192,55 @@ class CartPole:
         if np.any(state_bounds > model_bounds + 1e-12):
             raise ValueError("x_max cannot exceed the nonlinear MPC state bounds.")
 
-        # Generate feasible seeds by sampling the state space and solving the MPC problem.
+        if reference_method is None:
+            reference_method = "bilevel" if use_bilevel else "uniform"
+        reference_method = str(reference_method).lower()
+        if reference_method not in {"uniform", "bilevel", "slacked"}:
+            raise ValueError(
+                "reference_method must be 'uniform', 'bilevel', or 'slacked'."
+            )
+
+        # Generate the reference solutions used to build the local linearized OCPs.
         rng = np.random.default_rng(random_seed)
-        target_seed_count = min(num_feasible_seeds, num_samples)
-        if use_bilevel:
+        target_seed_count = num_feasible_seeds
+        if num_samples % target_seed_count != 0:
+            raise ValueError(
+                "num_samples must be divisible by num_feasible_seeds so each "
+                "reference produces the same number M of candidates."
+            )
+        samples_per_reference = num_samples // target_seed_count
+        reference_stats = {}
+        reference_time_s = 0.0
+        if reference_method == "bilevel":
+            reference_start = time.perf_counter()
             seeds, seed_solutions = self.collect_feasible_samples_with_bilevel(
                 x_max=state_bounds,
                 num_samples=target_seed_count,
                 max_attempts=max_seed_attempts,
                 return_solutions=True,
+                warm_start=warm_start,
             )
+            reference_time_s = time.perf_counter() - reference_start
             seed_attempts = int(
                 self.last_feasible_sampling_stats.get("attempts", max_seed_attempts)
             )
+            reference_stats = dict(self.last_feasible_sampling_stats)
+        elif reference_method == "slacked":
+            reference_start = time.perf_counter()
+            seeds, seed_solutions = self.collect_feasible_samples_with_slacked(
+                x_max=state_bounds,
+                close_to_bounds=close_to_bounds,
+                num_samples=target_seed_count,
+                max_attempts=max_seed_attempts,
+                plot_results=False,
+                slack_penalty=slack_penalty,
+                return_solutions=True,
+            )
+            reference_time_s = time.perf_counter() - reference_start
+            seed_attempts = int(
+                self.last_feasible_sampling_stats.get("attempts", max_seed_attempts)
+            )
+            reference_stats = dict(self.last_feasible_sampling_stats)
         else:
             seeds = []
             seed_solutions = []
@@ -1967,19 +2263,36 @@ class CartPole:
                     # Store the feasible seed and its corresponding solution
                     seeds.append(candidate)
                     seed_solutions.append(solution)
-        if len(seeds) == 0:
+        if len(seeds) != target_seed_count:
             raise RuntimeError(
-                f"No feasible seed found after {max_seed_attempts} attempts."
+                f"Collected {len(seeds)}/{target_seed_count} required "
+                f"{reference_method} reference solutions."
             )
 
         chains = []
-        for seed, solution in zip(seeds, seed_solutions):
+        for reference_index, (seed, solution) in enumerate(
+            zip(seeds, seed_solutions)
+        ):
+            linear_ocp = self._linearized_ocp_at_solution(solution)
+            box_margin = float(np.min(state_bounds - np.abs(seed)))
+            ocp_margin = float(np.min(linear_ocp["b"]))
+            if box_margin < -BOUNDARY_LP_FEASIBILITY_TOL:
+                raise RuntimeError(
+                    f"Reference {reference_index} is outside the Hit-and-Run "
+                    f"initial-state box by {-box_margin:.3e}."
+                )
             chains.append({
+                "reference_index": reference_index,
                 "seed": seed.copy(),
                 "seed_solution": solution,
                 "delta_x": np.zeros(4),
-                "linear_ocp": self._linearized_ocp_at_solution(solution),
+                "linear_ocp": linear_ocp,
+                "origin_box_margin": box_margin,
+                "origin_ocp_margin": ocp_margin,
                 "steps": 0,
+                "generated": 0,
+                "boundary_lp_failures": 0,
+                "projection_solution": solution,
             })
 
         # Accepted samples and raw linearized-MPC candidates are stored
@@ -1997,11 +2310,16 @@ class CartPole:
         # unbounded loop. This allowance is deliberately generous.
         max_chain_updates = 10 * num_samples
         chain_updates = 0
+        candidates_generated = 0
+        boundary_lp_time_s = 0.0
+        projection_time_s = 0.0
 
         # Round-robin Hit-and-Run updates across the local linear models.
-        while len(samples) < num_samples and chain_updates < max_chain_updates:
+        while candidates_generated < num_samples and chain_updates < max_chain_updates:
             chain = chains[chain_index % len(chains)]
             chain_index += 1
+            if chain["generated"] >= samples_per_reference:
+                continue
 
             # Normalizing an isotropic Gaussian vector gives a direction that
             # is uniform on the unit sphere.
@@ -2010,6 +2328,7 @@ class CartPole:
 
             # Two LPs identify the positive and negative endpoints of the
             # feasible chord through the current chain state.
+            lp_start = time.perf_counter()
             alpha_plus = self._linearized_boundary_step(
                 chain["delta_x"],
                 direction,
@@ -2022,28 +2341,53 @@ class CartPole:
                 chain["linear_ocp"],
                 state_bounds,
             )
+            boundary_lp_time_s += time.perf_counter() - lp_start
             chain_updates += 1
             if alpha_plus is None or alpha_minus is None:
                 boundary_lp_failures += 1
+                chain["boundary_lp_failures"] += 1
+                at_origin = np.linalg.norm(
+                    chain["delta_x"], ord=np.inf
+                ) <= BOUNDARY_LP_FEASIBILITY_TOL
+                if at_origin:
+                    raise RuntimeError(
+                        "Boundary LP failed at the guaranteed-feasible origin "
+                        f"of reference {chain['reference_index']}; "
+                        f"box margin={chain['origin_box_margin']:.3e}, "
+                        f"OCP margin={chain['origin_ocp_margin']:.3e}. "
+                        "This indicates a solver/interface failure rather than "
+                        "a failed Hit-and-Run direction."
+                    )
+                chain["delta_x"] = np.zeros(4)
+                continue
+            if alpha_plus < 0.0 or alpha_minus < 0.0:
+                # Defensive guard against a solver returning an invalid chord.
+                boundary_lp_failures += 1
+                chain["delta_x"] = np.zeros(4)
                 continue
 
-            # A uniform draw along the complete chord is the HR transition.
-            beta = rng.uniform(-alpha_minus, alpha_plus)
+            # Stay infinitesimally inside the chord. This prevents accumulated
+            # LP feasibility tolerances from moving the next chain state just
+            # outside its local polytope.
+            chord_width = alpha_plus + alpha_minus
+            # Stay farther inside than the LP feasibility tolerance; 1e-10 was
+            # too small to prevent the next chain point becoming numerically
+            # infeasible after an endpoint solve.
+            margin = min(
+                10.0 * BOUNDARY_LP_FEASIBILITY_TOL,
+                0.25 * chord_width,
+            )
+            beta = rng.uniform(-alpha_minus + margin, alpha_plus - margin)
             chain["delta_x"] = chain["delta_x"] + beta * direction
             chain["steps"] += 1
 
-            # Compute the candidate state by adding the perturbation to the seed, then project it onto the feasible set
+            # Compute the candidate state by adding the perturbation to the
+            # reference, then always use it as the nonlinear projection target.
             candidate = chain["seed"] + chain["delta_x"]
             raw_candidates.append(candidate.copy())
-            # The feasibility check and, if needed, the projection are performed below
-            # feasible = self.is_feasible(candidate)
-            # accepted = candidate
-            # was_projected = False
-            # if not feasible:
-            #     projection_needed += 1
-            #     if not project_infeasible:
-            #         projected.append(False)
-            #         continue
+            chain["generated"] += 1
+            candidates_generated += 1
+            projection_start = time.perf_counter()
             try:
                 # Projection changes only the returned training sample.
                 # The HR chain remains at its linearly feasible candidate,
@@ -2053,14 +2397,18 @@ class CartPole:
                     candidate,
                     Qx=Qx,
                     feasible_reference=chain["seed"],
-                    reference_solution=chain["seed_solution"],
+                    reference_solution=(
+                        chain["projection_solution"]
+                        if warm_start else chain["seed_solution"]
+                    ),
                     return_solution=True
                 )
             except RuntimeError:
+                projection_time_s += time.perf_counter() - projection_start
                 projection_failures += 1
                 continue
-            # Check if projection was needed a posteriori
-            # TODO: IMPROVE THIS TEST
+            projection_time_s += time.perf_counter() - projection_start
+            # Record whether the projection changed the target.
             projected_was_needed = not np.allclose(
                 projected_state, candidate, atol=1e-6, rtol=0.0
             )
@@ -2069,6 +2417,8 @@ class CartPole:
             _, projected_U = self.extract_traj(projected_solution["x"])
             accepted_raw_candidates.append(candidate.copy())
             samples.append(projected_state)
+            if warm_start:
+                chain["projection_solution"] = projected_solution
             controls.append(float(projected_U[0]))
             accepted_projected.append(projected_was_needed)
 
@@ -2088,15 +2438,30 @@ class CartPole:
             "projection_needed": int(projection_needed),
             "projection_failures": int(projection_failures),
             "boundary_lp_failures": int(boundary_lp_failures),
+            "boundary_lp_failures_per_reference": np.asarray(
+                [chain["boundary_lp_failures"] for chain in chains],
+                dtype=int,
+            ),
             "chain_updates": int(chain_updates),
-            # "burn_in": int(burn_in),
-            # "thinning": int(thinning),
             "projection_Qx": Qx.copy(),
+            "warm_start": bool(warm_start),
+            "reference_method": reference_method,
+            "reference_statistics": reference_stats,
+            "samples_per_reference": int(samples_per_reference),
+            "reference_time_s": float(reference_time_s),
+            "boundary_lp_time_s": float(boundary_lp_time_s),
+            "projection_time_s": float(projection_time_s),
         }
+        if candidates_generated < num_samples:
+            raise RuntimeError(
+                f"Generated only {candidates_generated}/{num_samples} candidates after "
+                f"{chain_updates} Hit-and-Run updates. Inspect "
+                "last_linearized_sampling_stats for failure counts."
+            )
         if result.shape[0] < num_samples:
             raise RuntimeError(
-                f"Collected only {result.shape[0]}/{num_samples} samples after "
-                f"{chain_updates} Hit-and-Run updates. Inspect "
+                f"Projected only {result.shape[0]}/{num_samples} candidates; "
+                "the Np*M projection pipeline is incomplete. Inspect "
                 "last_linearized_sampling_stats for failure counts."
             )
         if plot_results:
@@ -2368,16 +2733,23 @@ class CartPole:
         max_attempts=1000,
         plot_results=True,
         slack_penalty="quadratic",
-        print_constraint_jacobian=False,
-        print_optimality=False
+        print_stationarity_perturbation=False,
+        print_optimality=False,
+        return_solutions=False,
     ):
-        """Collect initial states found by successful extreme-state solves.
+        """Collect feasible states using the paper's slacked NMPC formulation.
 
-        ``slack_penalty`` selects an L1 or quadratic penalty in the underlying
-        extreme-state optimization.
+        The retained ``slack_penalty`` argument must be ``"quadratic"``.
         """
         if num_samples < 0:
             raise ValueError("num_samples must be non-negative.")
+        if max_attempts < 0:
+            raise ValueError("max_attempts must be non-negative.")
+        if str(slack_penalty).lower() != "quadratic":
+            raise ValueError(
+                "The paper-compliant slacked formulation only supports "
+                "slack_penalty='quadratic'."
+            )
         if x_max is None:
             x_max = np.array([self.p_bound, self.v_bound, self.theta_bound, self.omega_bound], dtype=float)
         else:
@@ -2386,10 +2758,12 @@ class CartPole:
                 raise ValueError("x_max must have shape (4,).")
 
         samples = []
+        solutions = []
         u0_values = []
         attempts_run = 0
         successful_extreme_solves = 0
         feasible_candidates = 0
+        optimal_slacked_solutions = 0
 
         for attempt in range(max_attempts):
             if len(samples) >= num_samples:
@@ -2403,7 +2777,7 @@ class CartPole:
                 u0_active_bound=u0_active_bound, 
                 plot_results=False,
                 slack_penalty=slack_penalty,
-                print_constraint_jacobian=print_constraint_jacobian,
+                print_stationarity_perturbation=print_stationarity_perturbation,
                 return_traj=True
             )
             
@@ -2416,12 +2790,15 @@ class CartPole:
                 _ = self.solve_MPC(x0_opt, warm_start=w_opt_slacked, return_traj=True, check_optimality=True)                
 
             successful_extreme_solves += 1
+            if self.last_slacked_c_star_is_zero:
+                optimal_slacked_solutions += 1
             # if not self.is_feasible(x0_opt):
             #     print(f"Attempt {attempt + 1}: x0 not feasible, skipping...")
             #     continue
             feasible_candidates += 1
 
             samples.append(x0_opt)
+            solutions.append({"x": ca.DM(w_opt_slacked)})
             u0_values.append(u0_opt)
             print(f"Collected {len(samples)}/{num_samples}")
 
@@ -2429,6 +2806,10 @@ class CartPole:
             print(f"Only collected {len(samples)} samples after {max_attempts} attempts")
         else:
             print(f"Collected {num_samples} samples")
+        print(
+            "Original-MPC-compatible slacked solutions (c*=0): "
+            f"{optimal_slacked_solutions}/{successful_extreme_solves}"
+        )
         
         def all_unique(samples):
             return len(samples) == len({
@@ -2440,7 +2821,7 @@ class CartPole:
         else:
             print("Warning: Some collected samples are duplicates.")
         
-        x0_samples = np.array(samples, dtype=float)
+        x0_samples = np.asarray(samples, dtype=float).reshape(-1, 4)
         u0_values = np.array(u0_values, dtype=float)
         self.last_feasible_sample_controls = u0_values
         self.last_feasible_sampling_stats = {
@@ -2449,7 +2830,14 @@ class CartPole:
             "returned_samples": int(x0_samples.shape[0]),
             "attempts": int(attempts_run),
             "successful_extreme_solves": int(successful_extreme_solves),
+            "c_star_evaluated_solutions": int(successful_extreme_solves),
             "feasible_candidates": int(feasible_candidates),
+            "optimal_slacked_solutions": int(optimal_slacked_solutions),
+            "optimal_slacked_solution_rate": (
+                float(optimal_slacked_solutions / successful_extreme_solves)
+                if successful_extreme_solves else 0.0
+            ),
+            "c_star_relative_tolerance": 1e-6,
         }
         if plot_results:
             fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
@@ -2479,11 +2867,26 @@ class CartPole:
             self.plot_policy_projections(x0_samples, u0_values)
             return feas_samples
         
+        if return_solutions:
+            return x0_samples, solutions
         return x0_samples
     
-    def collect_feasible_samples_with_bilevel(self, x_max, num_samples, max_attempts=100, plot_results=False, return_solutions=False):
+    def collect_feasible_samples_with_bilevel(
+        self,
+        x_max,
+        num_samples,
+        max_attempts=100,
+        plot_results=False,
+        return_solutions=False,
+        complementarity_method="ccopt",
+        check_sosc=False,
+        scholtes_relaxations=(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6),
+        warm_start=True,
+    ):
         """Collect initial states found by successful solves with bilevel optimization.
         The collected samples are guaranteed to be feasible and optimal for the MPC problem.
+        Repeated calls reuse the cached bilevel solver when their bounds and
+        complementarity settings match.
         """
         samples = []
         solutions = []
@@ -2493,7 +2896,13 @@ class CartPole:
         feasible_candidates = 0
         
         # Set up the bilevel optimization problem
-        bilevel_solver, w0, lbw, ubw, lbg, ubg, slack_block_sizes, mpc_vars, lambda_vars, slack_vars = self.bilevel_active_set(x_max, return_solver=True)
+        bilevel_solver, w0, lbw, ubw, lbg, ubg, slack_block_sizes, mpc_vars, lambda_vars, slack_vars = self.bilevel_active_set(
+            x_max,
+            return_solver=True,
+            complementarity_method=complementarity_method,
+            scholtes_relaxations=scholtes_relaxations,
+        )
+        bilevel_initial_guess = w0
 
         for attempt in range(max_attempts):
             if len(samples) >= num_samples:
@@ -2512,7 +2921,7 @@ class CartPole:
                         min_spikes=1,
                         max_spikes=max_spikes,
                         base_scale=1e-6,
-                        spike_factor_range=(1e6, 1e8),
+                        spike_factor_range=(1e0, 1e2),
                         spike_probability=0.6,
                     )
             
@@ -2520,7 +2929,7 @@ class CartPole:
             p_value = np.concatenate([x0_value, rho_value])
             # Solve the bilevel optimization problem with the sampled slack penalty weights
             sol = bilevel_solver(
-                x0=w0,
+                x0=bilevel_initial_guess,
                 lbx=lbw,
                 ubx=ubw,
                 lbg=lbg,
@@ -2535,6 +2944,8 @@ class CartPole:
                 continue
             
             feasible_candidates += 1
+            if warm_start:
+                bilevel_initial_guess = sol['x']
             
             x0_feasible = sol['x'][0:4].full().flatten()
             
@@ -2543,49 +2954,59 @@ class CartPole:
             lambda_opt, mu_opt = lambda_vars(sol['x'])
             slack_opt = slack_vars(sol['x'])
             
-            # The reduced Hessian is defined on the null space of the
-            # equality and active-inequality constraint Jacobians. A zero
-            # slack identifies an active original inequality.
-            active_mask = slack_opt.full().flatten() < 1e-6
-            jac_h = self.jac_h(x0_feasible, mpc_solution).full()
-            jac_g = self.jac_g(mpc_solution).full()
-            if active_mask.size != jac_g.shape[0]:
-                raise RuntimeError(
-                    "The inequality slack vector and constraint Jacobian "
-                    f"have incompatible sizes ({active_mask.size} and "
-                    f"{jac_g.shape[0]})."
+            if check_sosc:
+                # The reduced Hessian is defined on the null space of the
+                # equality and active-inequality constraint Jacobians. A zero
+                # slack identifies an active original inequality.
+                active_mask = slack_opt.full().flatten() < 1e-6
+                jac_h = self.jac_h(x0_feasible, mpc_solution).full()
+                jac_g = self.jac_g(mpc_solution).full()
+                if active_mask.size != jac_g.shape[0]:
+                    raise RuntimeError(
+                        "The inequality slack vector and constraint Jacobian "
+                        f"have incompatible sizes ({active_mask.size} and "
+                        f"{jac_g.shape[0]})."
+                    )
+                active_constraint_jacobian = np.vstack(
+                    [jac_h, jac_g[active_mask, :]]
                 )
-            active_constraint_jacobian = np.vstack(
-                [jac_h, jac_g[active_mask, :]]
-            )
-            Z = null_space(active_constraint_jacobian)
+                Z = null_space(active_constraint_jacobian)
+                
+                # Compute the reduced Hessian of the Lagrangian at the solution
+                H = self.hessian_L(
+                    mpc_solution, lambda_opt, mu_opt
+                ).full()
+                H_reduced = Z.T @ H @ Z
+                
+                # Apply the Cholesky decomposition to check if the reduced Hessian is positive definite
+                try:
+                    np.linalg.cholesky(H_reduced)
+                    kkt_residual = 0.0
+                    print("Reduced Hessian is positive definite.")
+                except np.linalg.LinAlgError:
+                    kkt_residual = np.linalg.norm(H_reduced - H_reduced.T) + np.sum(np.minimum(np.linalg.eigvalsh(H_reduced), 0.0)**2)
+                    print(f"Reduced Hessian is not positive definite. KKT residual: {kkt_residual:.6e}")
             
-            # Compute the reduced Hessian of the Lagrangian at the solution
-            H = self.hessian_L(
-                mpc_solution, lambda_opt, mu_opt
-            ).full()
-            H_reduced = Z.T @ H @ Z
             
-            # Apply the Cholesky decomposition to check if the reduced Hessian is positive definite
-            try:
-                np.linalg.cholesky(H_reduced)
-                kkt_residual = 0.0
-                print("Reduced Hessian is positive definite.")
-            except np.linalg.LinAlgError:
-                kkt_residual = np.linalg.norm(H_reduced - H_reduced.T) + np.sum(np.minimum(np.linalg.eigvalsh(H_reduced), 0.0)**2)
-                print(f"Reduced Hessian is not positive definite. KKT residual: {kkt_residual:.6e}")
-            
-            optimality = True if kkt_residual < 5e-4 else False
+                optimality = True if kkt_residual < 5e-4 else False
 
-            # optimality = optimality and self.solve_MPC(
-            #     x0_feasible,
-            #     warm_start=mpc_solution,
-            #     evaluate_kkt=True,
-            #     check_optimality=True,
-            # )
-            
-            if optimality:
-                feasible_and_optimal_candidates += 1
+                # optimality = optimality and self.solve_MPC(
+                #     x0_feasible,
+                #     warm_start=mpc_solution,
+                #     evaluate_kkt=True,
+                #     check_optimality=True,
+                # )
+                
+                if optimality:
+                    feasible_and_optimal_candidates += 1
+                    samples.append(x0_feasible)
+                    # Match the solution-dictionary interface returned by the
+                    # original MPC solver. Hit-and-Run uses this decision vector
+                    # both to linearize the trajectory and to warm-start the
+                    # nonlinear projection.
+                    solutions.append({"x": ca.DM(mpc_solution)})
+                    u0_values.append(u0_feasible)
+            else:
                 samples.append(x0_feasible)
                 # Match the solution-dictionary interface returned by the
                 # original MPC solver. Hit-and-Run uses this decision vector
@@ -2604,6 +3025,9 @@ class CartPole:
         u0_values = np.array(u0_values, dtype=float)
         self.last_feasible_sample_controls = u0_values
         self.last_feasible_sampling_stats = {
+            "complementarity_method": str(complementarity_method).lower(),
+            "solver_cache_hit": bool(self._last_bilevel_solver_cache_hit),
+            "warm_start": bool(warm_start),
             "requested_samples": int(num_samples),
             "returned_samples": int(x0_samples.shape[0]),
             "attempts": int(attempts_run),
@@ -2996,7 +3420,7 @@ class CartPole:
 
 if __name__ == "__main__":
     # Create cart-pole environment
-    N = 10
+    N = 50
     cart_pole = CartPole(N, dt_mpc=0.1, dt_sim=0.01, sym_type='SX')
     
     num_sims = 10
@@ -3024,25 +3448,25 @@ if __name__ == "__main__":
     # print("\n")
     # print(f"Collected {len(x0_batch)} feasible samples in {time.time() - start_time:.2f} seconds.")
     
-    # start_time = time.time()
+    start_time = time.time()
     # Compute an initial state using the bilevel optimization approach
-    # x0_batch = cart_pole.collect_feasible_samples_with_bilevel(
-    #     x_max=x_max,
-    #     num_samples=100,
-    #     max_attempts=1000,
-    #     plot_results=True
-    # )
-    # print("\n")
-    # print(f"Collected {len(x0_batch)} feasible and optimal samples with bilevel optimization in {time.time() - start_time:.2f} seconds.")
-    x0_batch = cart_pole.collect_linearized_hit_and_run_samples(
-        num_samples=1000,
-        num_feasible_seeds=5,
-        projection_Qx=100.0,
-        use_bilevel=True,
+    x0_batch = cart_pole.collect_feasible_samples_with_bilevel(
         x_max=x_max,
-        plot_results=True,
-        plot_3d=True,
+        num_samples=10,
+        max_attempts=100,
+        plot_results=False
     )
+    print("\n")
+    print(f"Collected {len(x0_batch)} feasible and optimal samples with bilevel optimization in {time.time() - start_time:.2f} seconds.")
+    # x0_batch = cart_pole.collect_linearized_hit_and_run_samples(
+    #     num_samples=1000,
+    #     num_feasible_seeds=5,
+    #     projection_Qx=100.0,
+    #     use_bilevel=True,
+    #     x_max=x_max,
+    #     plot_results=True,
+    #     plot_3d=True,
+    # )
     
     # stats = cart_pole.last_linearized_sampling_stats
     # print("Seed attempts:", stats["seed_attempts"])
