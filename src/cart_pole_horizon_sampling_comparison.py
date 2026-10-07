@@ -48,11 +48,12 @@ import contextlib
 import csv
 from dataclasses import dataclass, field
 import io
+import itertools
 import json
 from pathlib import Path
 import sys
 from time import perf_counter
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import matplotlib
 
@@ -80,6 +81,13 @@ LABELS = {
 }
 # Compact LaTeX-style labels for figure legends. Keep the descriptive labels
 # above unchanged because they are also written to CSV/JSON and console tables.
+# LaTeX rendering for the standalone paper figures.
+LATEX_RC = {
+    "text.usetex": True,
+    "font.family": "serif",
+    "xtick.labelsize": 15,
+    "ytick.labelsize": 15,
+}
 PLOT_LABELS = {
     "uniform": r"$\mathrm{Uniform+NMPC}$",
     "bilevel_projection": r"$\mathrm{Bilevel+projection}$",
@@ -107,12 +115,15 @@ LABEL_WIDTH = max(len(label) for label in LABELS.values())
 # Extra MPC initial guesses tried before a state is reported infeasible.
 MPC_RESTARTS = 1
 # A rollout stops once the closed loop has essentially reached the origin.
-ROLLOUT_ORIGIN_TOL = 1e-3
+ROLLOUT_ORIGIN_TOL = 1e-1
 # Bound on the seed batches drawn to reach the requested sample count.
 ROLLOUT_MAX_BATCHES = 8
 # Safety factor on a top-up batch: the marginal yield keeps falling as states
 # accumulate, so asking for exactly the projected count lands short.
 ROLLOUT_SEED_MARGIN = 1.35
+# A top-up batch requests at most this many times the previous batch, so one
+# low-yield batch cannot trigger a burst of expensive seed solves.
+ROLLOUT_MAX_BATCH_GROWTH = 3
 
 
 @dataclass
@@ -138,6 +149,7 @@ class SamplingResult:
     rollout_left_box: int = 0
     rollout_converged: int = 0
     rollout_duplicates: int = 0
+    rollout_rejected_seeds: int = 0
     rollout_batches: int = 0
     trajectories: List[np.ndarray] = field(default_factory=list)
     controls: np.ndarray = field(default_factory=lambda: np.empty(0))
@@ -221,8 +233,8 @@ def parse_args() -> argparse.Namespace:
         "--horizons",
         type=int,
         nargs="+",
-        default=[10, 15, 20, 25, 30],
-        # default=[10, 15, 20, 25, 30, 35, 40, 45, 50],
+        # default=[10, 15, 20, 25, 30],
+        default=[10, 15, 20, 25, 30, 35, 40, 45, 50],
         help="MPC horizons to sweep. One condensed table is printed per horizon.",
     )
     parser.add_argument("--num-samples", type=int, default=50)
@@ -326,7 +338,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PACKAGE_ROOT / "results" / "cart_pole_horizon_sampling_8",
+        default=PACKAGE_ROOT / "results" / "cart_pole_horizon_sampling_10",
     )
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
@@ -423,8 +435,12 @@ def solve_mpc(
     restarts: Optional[int] = None,
     tol: float = 1e-6,
     calls: Optional[SolverCalls] = None,
+    warm_start: Optional[np.ndarray] = None,
 ) -> Optional[dict]:
     """Solve the MPC at ``x0``, retrying from fresh guesses.
+
+    A ``warm_start`` of the MPC decision-vector size is tried before the
+    default guesses.
 
     Returns the primal solution, the predicted trajectory, the equality and
     bound multipliers and the number of extra restarts needed, or ``None`` when
@@ -436,7 +452,12 @@ def solve_mpc(
     rng = np.random.default_rng(0) if rng is None else rng
     restarts = MPC_RESTARTS if restarts is None else restarts
 
-    for attempt, guess in enumerate(mpc_warm_starts(model, x0, restarts, rng)):
+    guesses = mpc_warm_starts(model, x0, restarts, rng)
+    if warm_start is not None:
+        warm_start = np.asarray(warm_start, dtype=float).reshape(-1)
+        if warm_start.shape == np.shape(model.w0):
+            guesses = itertools.chain([warm_start], guesses)
+    for attempt, guess in enumerate(guesses):
         if calls is not None:
             calls.add()
         try:
@@ -756,6 +777,80 @@ def collect_slacked_projection(
     )
 
 
+def shifted_guess(model: CartPole, solution: dict) -> np.ndarray:
+    """Shift an MPC solution one step forward to warm-start the next solve."""
+    states = solution["states"]
+    controls = np.asarray(solution["controls"], dtype=float).reshape(1, -1)
+    states = np.hstack([states[:, 1:], states[:, -1:]])
+    controls = np.hstack([controls[:, 1:], np.zeros((1, 1))])
+    return np.asarray(model.traj_to_vec(states, controls).full(), dtype=float).reshape(-1)
+
+
+def propagate_seeds(
+    model: CartPole,
+    seeds: np.ndarray,
+    seed_guesses: List[Optional[np.ndarray]],
+    num_samples: int,
+    rollout_steps: int,
+    rollout_tol: float,
+    register: Callable[[np.ndarray], bool],
+    samples: List[np.ndarray],
+    trajectories: List[np.ndarray],
+    solver_rng: np.random.Generator,
+    calls: SolverCalls,
+) -> Dict[str, int]:
+    """Roll every seed out in closed loop, appending visited states to ``samples``.
+
+    A seed is kept only when the MPC solves at it. Each solve is warm-started
+    from the seed generator's MPC trajectory, then from the shifted previous
+    solution. A rollout stops at the origin, at an already collected state or
+    at a failed solve.
+    """
+    counts = {"steps": 0, "failures": 0, "converged": 0, "duplicates": 0, "rejected_seeds": 0}
+    for seed_state, guess in zip(seeds, seed_guesses):
+        if len(samples) >= num_samples:
+            break
+        if not register(seed_state):
+            counts["duplicates"] += 1
+            continue
+        solution = solve_mpc(model, seed_state, rng=solver_rng, calls=calls, warm_start=guess)
+        counts["steps"] += 1
+        if solution is None:
+            counts["failures"] += 1
+            counts["rejected_seeds"] += 1
+            continue
+        trajectory = [seed_state]
+        samples.append(seed_state)
+        for step in range(rollout_steps):
+            if len(samples) >= num_samples:
+                break
+            if np.max(np.abs(trajectory[-1])) <= rollout_tol:
+                counts["converged"] += 1
+                break
+            if step > 0:
+                solution = solve_mpc(
+                    model,
+                    trajectory[-1],
+                    rng=solver_rng,
+                    calls=calls,
+                    warm_start=shifted_guess(model, solution),
+                )
+                counts["steps"] += 1
+                if solution is None:
+                    counts["failures"] += 1
+                    break
+            # The MPC's own predicted successor: inside the state box by
+            # construction, since the MPC bounds its whole trajectory.
+            state = solution["states"][:, 1]
+            if not register(state):
+                counts["duplicates"] += 1
+                break
+            trajectory.append(state)
+            samples.append(state)
+        trajectories.append(np.asarray(trajectory, dtype=float))
+    return counts
+
+
 def collect_bilevel_rollout(
     model: CartPole,
     num_samples: int,
@@ -792,7 +887,9 @@ def collect_bilevel_rollout(
     rollout_failures = 0
     converged = 0
     duplicates = 0
+    rejected_seeds = 0
     batches = 0
+    previous_request: Optional[int] = None
     calls = SolverCalls()
     batch_yield: Optional[float] = None
     seen: set = set()
@@ -818,7 +915,10 @@ def collect_bilevel_rollout(
             requested = int(np.ceil(ROLLOUT_SEED_MARGIN * missing / batch_yield))
         else:
             requested = int(np.ceil(missing / states_per_rollout))
+        if previous_request is not None:
+            requested = min(requested, ROLLOUT_MAX_BATCH_GROWTH * previous_request)
         requested = max(requested, 1)
+        previous_request = requested
         batch_start_samples = len(samples)
         batch_start_seeds = len(seed_states)
 
@@ -832,6 +932,7 @@ def collect_bilevel_rollout(
                     check_sosc=False,
                     plot_results=False,
                     warm_start=warm_start,
+                    return_solutions=True,
                 )
         except Exception as exc:
             raise RuntimeError(
@@ -840,6 +941,8 @@ def collect_bilevel_rollout(
         generation_s += perf_counter() - start
         batches += 1
 
+        seeds, seed_solutions = seeds
+        seed_guesses = [np.asarray(sol["x"], dtype=float).reshape(-1) for sol in seed_solutions]
         seeds = normalize_samples(seeds)
         stats = model.last_feasible_sampling_stats
         batch_attempts = int(stats["attempts"])
@@ -854,34 +957,16 @@ def collect_bilevel_rollout(
         seed_states.extend(seeds)
 
         start = perf_counter()
-        for seed_state in seeds:
-            if len(samples) >= num_samples:
-                break
-            if not register(seed_state):
-                duplicates += 1
-                continue
-            trajectory = [seed_state]
-            samples.append(seed_state)
-            state = seed_state
-            for _ in range(rollout_steps):
-                if len(samples) >= num_samples:
-                    break
-                if np.max(np.abs(state)) <= rollout_tol:
-                    converged += 1
-                solution = solve_mpc(model, state, rng=solver_rng, calls=calls)
-                simulated_steps += 1
-                if solution is None:
-                    rollout_failures += 1
-                    break
-                # The MPC's own predicted successor: inside the state box by
-                # construction, since the MPC bounds its whole trajectory.
-                state = solution["states"][:, 1]
-                if not register(state):
-                    duplicates += 1
-                trajectory.append(state)
-                samples.append(state)
-            trajectories.append(np.asarray(trajectory, dtype=float))
+        counts = propagate_seeds(
+            model, seeds, seed_guesses, num_samples, rollout_steps, rollout_tol,
+            register, samples, trajectories, solver_rng, calls,
+        )
         rollout_s += perf_counter() - start
+        simulated_steps += counts["steps"]
+        rollout_failures += counts["failures"]
+        converged += counts["converged"]
+        duplicates += counts["duplicates"]
+        rejected_seeds += counts["rejected_seeds"]
 
         new_seeds = len(seed_states) - batch_start_seeds
         if new_seeds > 0:
@@ -922,6 +1007,7 @@ def collect_bilevel_rollout(
         rollout_failures=rollout_failures,
         rollout_converged=converged,
         rollout_duplicates=duplicates,
+        rollout_rejected_seeds=rejected_seeds,
         rollout_batches=batches,
         trajectories=trajectories,
     )
@@ -967,7 +1053,9 @@ def collect_slacked_rollout(
     rollout_failures = 0
     converged = 0
     duplicates = 0
+    rejected_seeds = 0
     batches = 0
+    previous_request: Optional[int] = None
     calls = SolverCalls()
     batch_yield: Optional[float] = None
     seen: set = set()
@@ -991,7 +1079,10 @@ def collect_slacked_rollout(
             requested = int(np.ceil(ROLLOUT_SEED_MARGIN * missing / batch_yield))
         else:
             requested = int(np.ceil(missing / states_per_rollout))
+        if previous_request is not None:
+            requested = min(requested, ROLLOUT_MAX_BATCH_GROWTH * previous_request)
         requested = max(requested, 1)
+        previous_request = requested
         batch_start_samples = len(samples)
         batch_start_seeds = len(seed_states)
 
@@ -1004,10 +1095,13 @@ def collect_slacked_rollout(
                 max_attempts=remaining_attempts,
                 plot_results=False,
                 slack_penalty=slack_penalty,
+                return_solutions=True,
             )
         generation_s += perf_counter() - start
         batches += 1
 
+        seeds, seed_solutions = seeds
+        seed_guesses = [np.asarray(sol["x"], dtype=float).reshape(-1) for sol in seed_solutions]
         seeds = normalize_samples(seeds)
         stats = model.last_feasible_sampling_stats
         batch_attempts = int(stats["attempts"])
@@ -1023,34 +1117,16 @@ def collect_slacked_rollout(
         seed_states.extend(seeds)
 
         start = perf_counter()
-        for seed_state in seeds:
-            if len(samples) >= num_samples:
-                break
-            if not register(seed_state):
-                duplicates += 1
-                continue
-            trajectory = [seed_state]
-            samples.append(seed_state)
-            state = seed_state
-            for _ in range(rollout_steps):
-                if len(samples) >= num_samples:
-                    break
-                if np.max(np.abs(state)) <= rollout_tol:
-                    converged += 1
-                solution = solve_mpc(model, state, rng=solver_rng, calls=calls)
-                simulated_steps += 1
-                if solution is None:
-                    rollout_failures += 1
-                    break
-                # The MPC's own predicted successor: inside the state box by
-                # construction, since the MPC bounds its whole trajectory.
-                state = solution["states"][:, 1]
-                if not register(state):
-                    duplicates += 1
-                trajectory.append(state)
-                samples.append(state)
-            trajectories.append(np.asarray(trajectory, dtype=float))
+        counts = propagate_seeds(
+            model, seeds, seed_guesses, num_samples, rollout_steps, rollout_tol,
+            register, samples, trajectories, solver_rng, calls,
+        )
         rollout_s += perf_counter() - start
+        simulated_steps += counts["steps"]
+        rollout_failures += counts["failures"]
+        converged += counts["converged"]
+        duplicates += counts["duplicates"]
+        rejected_seeds += counts["rejected_seeds"]
 
         new_seeds = len(seed_states) - batch_start_seeds
         if new_seeds > 0:
@@ -1092,6 +1168,7 @@ def collect_slacked_rollout(
         rollout_failures=rollout_failures,
         rollout_converged=converged,
         rollout_duplicates=duplicates,
+        rollout_rejected_seeds=rejected_seeds,
         rollout_batches=batches,
         trajectories=trajectories,
     )
@@ -1310,6 +1387,7 @@ def print_summary(results: List[SamplingResult], horizon: int) -> None:
                 f"converged={result.rollout_converged}, "
                 f"failed={result.rollout_failures}, "
                 f"duplicates={result.rollout_duplicates}, "
+                f"rejected seeds={result.rollout_rejected_seeds}, "
                 f"batches={result.rollout_batches}."
             )
 
@@ -1692,6 +1770,7 @@ def _draw_metric_vs_horizon(
     std_key: Optional[str],
     ylabel: str,
     log_scale: bool,
+    fontsize: Optional[float] = None,
 ) -> None:
     """Draw one mean +/- std metric against the horizon, one line per method."""
     for method, label in PLOT_LABELS.items():
@@ -1720,8 +1799,8 @@ def _draw_metric_vs_horizon(
             markersize=6,
             label=label,
         )
-    ax.set_xlabel(r"$N$")
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel(r"$N$", fontsize=fontsize)
+    ax.set_ylabel(ylabel, fontsize=fontsize)
     ax.set_xticks(horizons)
     ax.grid(alpha=0.25)
     if log_scale:
@@ -1752,21 +1831,23 @@ def plot_acceptance_rate_vs_horizon(
     rows: List[dict], horizons: List[int], output_dir: Path
 ) -> None:
     """Standalone figure: acceptance rate (mean +/- std) versus horizon."""
-    fig, ax = plt.subplots(figsize=(6.4, 5.0))
-    _draw_metric_vs_horizon(
-        ax,
-        rows,
-        horizons,
-        "acceptance_rate_mean_pct",
-        "acceptance_rate_std_pct",
-        r"Acceptance rate $[\%]$",
-        log_scale=False,
-    )
-    ax.legend(loc="best", fontsize=8)
-    # ax.set_title("Acceptance rate versus MPC horizon")
-    fig.tight_layout()
-    fig.savefig(output_dir / "acceptance_rate_vs_horizon.png", dpi=190)
-    fig.savefig(output_dir / "acceptance_rate_vs_horizon.pdf", bbox_inches="tight")
+    with plt.rc_context(LATEX_RC):
+        fig, ax = plt.subplots(figsize=(6.4, 5.0))
+        _draw_metric_vs_horizon(
+            ax,
+            rows,
+            horizons,
+            "acceptance_rate_mean_pct",
+            "acceptance_rate_std_pct",
+            r"Acceptance rate $[\%]$",
+            log_scale=False,
+            fontsize=20,
+        )
+        ax.legend(loc="best", fontsize=9)
+        # ax.set_title("Acceptance rate versus MPC horizon")
+        fig.tight_layout()
+        fig.savefig(output_dir / "acceptance_rate_vs_horizon.png", dpi=190)
+        fig.savefig(output_dir / "acceptance_rate_vs_horizon.pdf", bbox_inches="tight")
 
 
 def plot_total_time_vs_horizon(
@@ -1778,21 +1859,23 @@ def plot_total_time_vs_horizon(
     :func:`plot_horizon_trends`), this is the total cost of one run --
     ``elapsed_s`` -- averaged over ``--repeats`` reruns.
     """
-    fig, ax = plt.subplots(figsize=(6.4, 5.0))
-    _draw_metric_vs_horizon(
-        ax,
-        rows,
-        horizons,
-        "total_time_mean_s",
-        "total_time_std_s",
-        r"Total wall time $[\mathrm{s}]$",
-        log_scale=True,
-    )
-    ax.legend(loc="best", fontsize=8)
-    # ax.set_title("Total computation time versus MPC horizon")
-    fig.tight_layout()
-    fig.savefig(output_dir / "total_time_vs_horizon.png", dpi=190)
-    fig.savefig(output_dir / "total_time_vs_horizon.pdf", bbox_inches="tight")
+    with plt.rc_context(LATEX_RC):
+        fig, ax = plt.subplots(figsize=(6.4, 5.0))
+        _draw_metric_vs_horizon(
+            ax,
+            rows,
+            horizons,
+            "total_time_mean_s",
+            "total_time_std_s",
+            r"Total wall time $[\mathrm{s}]$",
+            log_scale=True,
+            fontsize=20,
+        )
+        ax.legend(loc="best", fontsize=9)
+        # ax.set_title("Total computation time versus MPC horizon")
+        fig.tight_layout()
+        fig.savefig(output_dir / "total_time_vs_horizon.png", dpi=190)
+        fig.savefig(output_dir / "total_time_vs_horizon.pdf", bbox_inches="tight")
 
 
 def save_samples(results: List[SamplingResult], horizon: int, output_dir: Path) -> None:

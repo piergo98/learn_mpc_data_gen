@@ -2920,7 +2920,7 @@ class CartPole:
                         slack_block_sizes,
                         min_spikes=1,
                         max_spikes=max_spikes,
-                        base_scale=1e-6,
+                        base_scale=1e-1,
                         spike_factor_range=(1e0, 1e2),
                         spike_probability=0.6,
                     )

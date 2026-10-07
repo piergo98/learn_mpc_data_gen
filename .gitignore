@@ -17,3 +17,11 @@ env/
 # Experiment output
 results/*
 !results/.gitkeep
+
+# Some sources
+src/point_mass_obstacle_sampling_comparison.py
+src/replot*
+src/discontinuous_control_sampling_comparison.py
+src/sampling_strategy_supervised_comparison.py
+src/cart_pole_hit_and_run_seed_comparison.py
+src/cart_pole_feasible_sampling_comparison.py

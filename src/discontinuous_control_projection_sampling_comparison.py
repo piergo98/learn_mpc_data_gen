@@ -70,6 +70,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.linalg import null_space
 
+# LaTeX text everywhere, with the paper font sizes for labels and legends.
+plt.rcParams.update(
+    {
+        "text.usetex": True,
+        "font.family": "serif",
+        "axes.labelsize": 24,
+        "xtick.labelsize": 15,
+        "ytick.labelsize": 15,
+        "legend.fontsize": 9,
+    }
+)
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
@@ -111,7 +123,7 @@ FEASIBLE_SET_RESOLUTION = 1201
 MPC_RESTARTS = 2
 # A closed-loop rollout stops once it reaches the origin: with the terminal
 # constraint x_N = 0 the state stays there, so further steps only duplicate it.
-ROLLOUT_ORIGIN_TOL = 1e-9
+ROLLOUT_ORIGIN_TOL = 1e-1
 # Bound on the seed batches drawn to reach the requested sample count. Each
 # batch re-enters the sampler, which rebuilds its solver, so the top-up should
 # converge in a couple of rounds rather than creep up on the target.
@@ -339,7 +351,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PACKAGE_ROOT / "results" / "discontinuous_control_projection_sampling_4",
+        default=PACKAGE_ROOT / "results" / "discontinuous_control_projection_sampling_7",
     )
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
@@ -593,11 +605,20 @@ def draw_feasible_set(
         edgecolor="0.9",
         linewidth=2.0,
         zorder=0,
-        label="MPC feasible set" if label else None,
     )
     for boundary in (lower, upper):
         masked = np.where(nonempty, boundary, np.nan)
         ax.plot(s_values, masked, color="0.45", linewidth=1.0, zorder=0)
+    if label:
+        # Empty proxy so the legend swatch carries the thin boundary outline.
+        ax.fill(
+            [],
+            [],
+            facecolor=matplotlib.colors.to_rgba("aquamarine", 0.2),
+            edgecolor="0.45",
+            linewidth=1.0,
+            label="MPC feasible set",
+        )
 
 
 def draw_sampling_box(
@@ -1778,14 +1799,14 @@ def plot_samples(
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
-            ax.legend(handles, labels, loc="best", fontsize=10)
+            ax.legend(handles, labels, loc="best")
 
     colorbar_mappable = matplotlib.cm.ScalarMappable(norm=normalization, cmap=colormap)
     colorbar_mappable.set_array([])
     fig.colorbar(
         colorbar_mappable,
         cax=colorbar_axis,
-        label=r"first optimal control $u_0^\star$",
+        label=r"$u_0^\star$",
     )
     fig.savefig(output_dir / "sampled_initial_states.png", dpi=190)
     fig.savefig(output_dir / "sampled_initial_states.pdf", bbox_inches="tight")
@@ -1842,7 +1863,7 @@ def plot_post_processing(
                 )
             ax.set_title(
                 f"{LABELS[result.method]}\n"
-                f"{result.rollout_seeds} seeds x {result.rollout_steps} closed-loop steps"
+                f"{result.rollout_seeds} seeds $\\times$ {result.rollout_steps} closed-loop steps"
             )
         else:
             candidates = result.candidates
@@ -1881,14 +1902,14 @@ def plot_post_processing(
             )
             ax.set_title(
                 f"{LABELS[result.method]}\nprojection moved "
-                f"{100.0 * moved_fraction:.0f}% of candidates"
+                f"{100.0 * moved_fraction:.0f}\\% of candidates"
             )
         ax.set_xlim(-1.04 * bounds[0], 1.04 * bounds[0])
         ax.set_ylim(-1.04 * bounds[1], 1.04 * bounds[1])
         ax.set_xlabel(r"$x_{0,1}$")
         ax.set_ylabel(r"$x_{0,2}$")
         ax.grid(alpha=0.25)
-        ax.legend(loc="best", fontsize=9)
+        ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(output_dir / "post_processing_effect.png", dpi=190)
     fig.savefig(output_dir / "post_processing_effect.pdf", bbox_inches="tight")
@@ -2031,16 +2052,16 @@ def _draw_linearized_panel(
         )
     else:
         headline = (
-            f"{100.0 * entry['valid_fraction']:.0f}% of "
+            f"{100.0 * entry['valid_fraction']:.0f}\\% of "
             r"$\mathcal{X}_{\mathrm{lin}}$ feasible, covers "
-            f"{100.0 * entry['covered_fraction']:.0f}% of "
+            f"{100.0 * entry['covered_fraction']:.0f}\\% of "
             r"$\mathcal{X}$"
         )
     ax.set_title(
         f"$\\bar{{x}}_0=({reference[0]:.2f},\\,{reference[1]:.2f})$\n{headline}",
         fontsize=10,
     )
-    ax.legend(loc="lower right", fontsize=8)
+    ax.legend(loc="lower right")
 
 
 def save_linearized_sets(entries: List[dict], output_dir: Path) -> None:
@@ -2114,7 +2135,7 @@ def plot_statistics(results: List[SamplingResult], output_dir: Path) -> None:
     )
     axes[0].set_ylabel("wall time [s]")
     axes[0].set_title("Computation time")
-    axes[0].legend(loc="best", fontsize=9)
+    axes[0].legend(loc="best")
 
     axes[1].bar(positions, [result.seconds_per_sample for result in results], color=colors)
     axes[1].set_ylabel("seconds / accepted sample")
@@ -2134,7 +2155,7 @@ def plot_statistics(results: List[SamplingResult], output_dir: Path) -> None:
     )
     axes[4].set_ylabel("NLP solves")
     axes[4].set_title("Solver calls")
-    axes[4].legend(loc="upper right", fontsize=8)
+    axes[4].legend(loc="upper right")
 
     scale = np.array(
         [100.0 / result.attempts if result.attempts else 0.0 for result in results]
@@ -2152,9 +2173,9 @@ def plot_statistics(results: List[SamplingResult], output_dir: Path) -> None:
         label="SOSC rejection",
     )
     axes[2].set_ylim(0.0, 100.0)
-    axes[2].set_ylabel("rejection rate [%]")
+    axes[2].set_ylabel(r"rejection rate [\%]")
     axes[2].set_title("Candidate rejection by cause")
-    axes[2].legend(loc="upper right", fontsize=8)
+    axes[2].legend(loc="upper right")
 
     share = np.array(
         [100.0 / result.accepted if result.accepted else 0.0 for result in results]
@@ -2177,9 +2198,9 @@ def plot_statistics(results: List[SamplingResult], output_dir: Path) -> None:
     # Both bars usually sit at 100%, so leave headroom for the legend.
     axes[3].set_ylim(0.0, 128.0)
     axes[3].set_yticks(np.arange(0.0, 101.0, 20.0))
-    axes[3].set_ylabel("accepted samples [%]")
+    axes[3].set_ylabel(r"accepted samples [\%]")
     axes[3].set_title("Feasibility and local optimality")
-    axes[3].legend(loc="upper center", fontsize=8, ncol=2)
+    axes[3].legend(loc="upper center", ncol=2)
 
     for ax in axes:
         ax.set_xticks(positions, labels, rotation=18, ha="right")

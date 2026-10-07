@@ -1129,8 +1129,8 @@ class DiscontinuousControl:
         for k in range(self.N):
             uk = ca.SX.sym(f"u_{k}", 1)
             w += [uk]
-            lbw += [-self.control_bound]
-            ubw += [self.control_bound]
+            lbw += [-ca.inf]
+            ubw += [ca.inf]
             w0 += [0.0]
             w_mpc += [uk]
             
@@ -2283,9 +2283,17 @@ class DiscontinuousControl:
         scholtes_relaxations=(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6),
         return_solutions=False,
         warm_start=True,
+        close_to_bounds=True,
+        u0_active_bound=False,
     ):
         """Collect initial states found by successful solves with bilevel optimization.
         The collected samples are guaranteed to be feasible and optimal for the MPC problem.
+
+        The slack weights are drawn as in :meth:`seek_x0`: zero everywhere
+        except a random target set T of at most ``n_w - m_h`` residuals, one
+        side per bound, each weighted log-uniformly in ``[1, 100]``.
+        ``close_to_bounds=False`` targets only input bounds and
+        ``u0_active_bound=True`` always targets the ``u_0`` bound.
         """
         samples = []
         solutions = []
@@ -2303,21 +2311,59 @@ class DiscontinuousControl:
         )
         bilevel_initial_guess = w0
 
+        # Residual pairs of every bound: each block stores its upper residuals
+        # first, then its lower ones. The first block is the x0 state bounds.
+        residual_pairs = []
+        offset = 0
+        for block_size in slack_block_sizes:
+            for component in range(block_size):
+                residual_pairs.append(
+                    (offset + component, offset + block_size + component)
+                )
+            offset += 2 * block_size
+        n_state_pairs = slack_block_sizes[0]
+
+        # Sampling at most n_w - m_h targets enforces m_h + |T| <= n_w. As in
+        # seek_x0, x0 is a decision variable here, so the MPC's initial-state
+        # equality X0 = x0 does not count: only the terminal constraint does.
+        n_w = mpc_vars(ca.vertcat(*w0)).numel()
+        m_h = lambda_vars(ca.vertcat(*w0))[0].numel() - n_state_pairs
+        eligible_pairs = np.arange(len(residual_pairs), dtype=int)
+        if not close_to_bounds:
+            # Retain the historical option's intent: target only input bounds.
+            eligible_pairs = eligible_pairs[n_state_pairs:]
+        forced_pair = n_state_pairs if u0_active_bound else None
+        if forced_pair is not None and forced_pair not in eligible_pairs:
+            eligible_pairs = np.append(eligible_pairs, forced_pair)
+        max_targets = min(n_w - m_h, eligible_pairs.size)
+        if max_targets < 1:
+            raise RuntimeError("No inequality constraints are available for targeting.")
+
         for attempt in range(max_attempts):
             if len(samples) >= num_samples:
                 break
             attempts_run = attempt + 1
-    
             # Sample slack penalty weights for the bilevel optimization
-            rho_value, _ = self.spiky_residual_weights(
-                        slack_block_sizes,
-                        min_spikes=1,
-                        max_spikes=2,
-                        base_scale=1e-6,
-                        spike_factor_range=(1e6, 1e8),
-                        spike_probability=1.0,
-                    )
-            
+            num_targets = np.random.randint(1, max_targets + 1)
+            if forced_pair is None:
+                target_pairs = np.random.choice(
+                    eligible_pairs, size=num_targets, replace=False
+                )
+            else:
+                remaining = eligible_pairs[eligible_pairs != forced_pair]
+                extra_count = num_targets - 1
+                extras = np.random.choice(remaining, size=extra_count, replace=False)
+                target_pairs = np.r_[forced_pair, extras]
+
+            rho_value = np.zeros(2 * sum(slack_block_sizes), dtype=float)
+            target_residuals = np.array(
+                [residual_pairs[pair][np.random.randint(2)] for pair in target_pairs],
+                dtype=int,
+            )
+            rho_value[target_residuals] = 10.0 ** np.random.uniform(
+                0.0, 2.0, size=target_residuals.size
+            )
+
             x0_value = np.array([0.0, 0.0])
             p_value = np.concatenate([x0_value, rho_value])
             
