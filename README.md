@@ -29,8 +29,8 @@ then project back onto the nonlinear one.
 | Name | Model method | Idea |
 | --- | --- | --- |
 | **uniform** | `is_feasible` + rejection | Draw from the state box, keep it if the MPC solves. The baseline. |
-| **slacked** | `seek_x0`, `collect_feasible_samples_with_slacked` | Add slacks to the MPC residuals with randomly *spiked* weights (`spiky_residual_weights`) and minimize them. Different random weights push the solution to different corners of the feasible set. Quadratic or L1 penalty. |
-| **bilevel** | `bilevel_active_set`, `collect_feasible_samples_with_bilevel` | Solve a bilevel problem whose lower level is the MPC KKT system with explicit complementarity constraints. Every solution is feasible by construction, so this sampler cannot return an infeasible state. Needs the CasADi `ccopt` plugin. |
+| **slacked** | `seek_x0`, `collect_feasible_samples_with_slacked` | Replace every MPC inequality by `g(w) + s = 0`, `s >= 0`, and minimize the MPC cost plus `0.5 s^T Q s`. The positive sampled diagonal entries of `Q` target different active sets and obey `m_h + |T| <= n_w`. |
+| **bilevel** | `bilevel_active_set`, `collect_feasible_samples_with_bilevel` | Solve a bilevel problem whose lower level is the MPC KKT system with explicit complementarity constraints. Every solution is feasible by construction, so this sampler cannot return an infeasible state. Complementarity can use `ccopt` or a Scholtes homotopy solved with IPOPT. |
 | **Hit-and-Run** | `collect_linearized_hit_and_run_samples`, `sample_hit_and_run` | Linearize the OCP at a feasible seed, run a Hit-and-Run chain inside the resulting polytope (LPs solved with `qpoases`), then map each proposal back with `project_onto_feasible_set`. |
 | **hybrid / seeded HR** | combination | Hit-and-Run seeded from bilevel solutions instead of uniform ones — the seed quality is the only difference. |
 | **rollout** | `solve_MPC` / `run_closed_loop_batch`, driven by the scripts | Propagate a few good seeds with closed-loop MPC and keep every visited state. Cheap per sample, but samples are correlated along trajectories. Implemented in the experiment scripts (`collect_bilevel_rollout`), not as a model method — only `CartPole` exposes a batched `run_closed_loop_batch`. |
@@ -51,7 +51,8 @@ Not every model implements every strategy — see the table in
 │   ├── cart_pole.py            -> CartPole
 │   ├── discontinuous_control.py-> DiscontinuousControl
 │   ├── linear.py               -> LinearSystem
-│   └── point_mass.py           -> PointMass, CircularObstacle
+│   ├── point_mass.py           -> PointMass, CircularObstacle
+│   └── scholtes_homotopy.py    -> IPOPT homotopy solver adapter
 ├── src/                    # executable comparison experiments
 │   ├── cart_pole_feasible_sampling_comparison.py
 │   ├── cart_pole_hit_and_run_seed_comparison.py
@@ -93,18 +94,19 @@ The models build their problems with CasADi and need three solver plugins:
 | --- | --- | --- |
 | `ipopt` (`nlpsol`) | nonlinear MPC, seed problems, slacked and projection problems | yes |
 | `qpoases` (`conic`) | linear programs of the Hit-and-Run chain | yes |
-| `ccopt` (`nlpsol`) | complementarity relaxation of the bilevel active-set sampler | **no** |
+| `ccopt` (`nlpsol`) | optional native complementarity solver for the bilevel active-set sampler | **no** |
 
-The **bilevel** sampler therefore requires a CasADi build with the `ccopt`
-plugin, and that build must be recent enough to accept the `cc_pairs` option.
-Point the interpreter at it before running:
+The **bilevel** sampler defaults to `ccopt`, which requires a CasADi build with
+that plugin recent enough to accept the `cc_pairs` option. Point the interpreter
+at it before running:
 
 ```bash
 export PYTHONPATH=/path/to/casadi-ccopt/lib:$PYTHONPATH
 export LD_LIBRARY_PATH=/path/to/casadi-ccopt/lib:$LD_LIBRARY_PATH
 ```
 
-Everything that does not use the bilevel sampler runs on the stock wheel.
+The stock wheel can run every method when the bilevel sampler is configured
+with `complementarity_method="scholtes"`.
 
 ---
 
@@ -149,19 +151,25 @@ Output: `sampling_statistics.{csv,json}`, `sampled_initial_states.png`,
 ### 3. Discontinuous control — projection vs. rollout post-processing
 
 The paper-facing version of the previous experiment. Compares `uniform`,
-`bilevel_projection`, `slacked_projection`, and `bilevel_rollout`, and splits
-the wall-clock time into a generation and a post-processing phase. Rejections
+`bilevel_projection`, `slacked_projection`, `bilevel_rollout`, and
+`slacked_rollout`. For each projection method it generates `--num-references`
+reference solutions, linearizes the NMPC at each reference, draws an equal
+number of bounded Hit-and-Run candidates from every local feasible set, and
+uses every candidate as the target of the nonlinear projection problem. Thus
+`--num-samples = Np * M`. Rejections
 are reported *by cause* rather than as a single rate, because the bilevel
 sampler cannot produce an infeasible state and can only lose a candidate for
-other reasons.
+other reasons. For the rollout method, acceptance rate means successful bilevel
+seed solves divided by bilevel seed attempts; closed-loop MPC steps are tracked
+separately and are not included in that rate.
 
 ```bash
 python3 src/discontinuous_control_projection_sampling_comparison.py \
     --num-samples 50 --repeats 3
 ```
 
-Key options: `--horizon`, `--state-bound`, `--projection-weight`,
-`--slack-penalty {quadratic,l1}`, `--close-to-bounds/--no-close-to-bounds`,
+Key options: `--horizon`, `--state-bound`, `--num-references`, `--projection-weight`,
+`--slack-penalty quadratic`, `--close-to-bounds/--no-close-to-bounds`,
 `--rollout-steps`, `--rollout-seeds`, `--rollout-dedupe`, `--rollout-tol`,
 `--linearization-points`, `--mpc-restarts`, `--repeats`.
 Output: `paper_summary.csv`, `sampling_statistics.{csv,json}`,
@@ -207,7 +215,7 @@ Output: `summary.csv`, `projected_samples_pairwise.png`,
 
 ### 6. Cart-pole — effect of the MPC horizon
 
-Runs the four samplers of experiment 3 once per horizon, so the cost of data
+Runs the five samplers of experiment 3 once per horizon, so the cost of data
 generation can be read as a function of `N`.
 
 ```bash
@@ -255,7 +263,7 @@ Shared sampler entry points:
 ```python
 model.is_feasible(x0)                             # rejection test
 model.seek_x0(...)                                # slacked extreme-state problem
-model.spiky_residual_weights(...)                 # random spiked slack weights
+model.spiky_residual_weights(...)                 # legacy/general weight helper
 model.bilevel_active_set(x_max, ...)              # bilevel active-set problem
 model.collect_feasible_samples_with_slacked(...)  # slacked sampler, batched
 model.collect_feasible_samples_with_bilevel(...)  # bilevel sampler, batched
@@ -281,9 +289,11 @@ import numpy as np
 rng = np.random.default_rng(0)
 uniform = [x for x in rng.uniform(-2, 2, size=(200, 2)) if model.is_feasible(x)]
 
-# 2. bilevel sampler (needs the ccopt plugin)
+# 2. bilevel sampler using the stock-wheel IPOPT plugin
 bilevel = model.collect_feasible_samples_with_bilevel(
-    x_max=np.array([2.0, 2.0]), num_samples=20
+    x_max=np.array([2.0, 2.0]),
+    num_samples=20,
+    complementarity_method="scholtes",
 )
 
 # 3. linearized Hit-and-Run with nonlinear projection
