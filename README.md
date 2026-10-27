@@ -1,4 +1,4 @@
-# Computationally Efficient Data Generation for Learning Nonlinear MPC Policies
+# Learning MPC Data Generation
 
 Code for generating feasible, locally optimal initial states for learning NMPC
 policies. It combines active-set exploration (bilevel / slacked problems) with
