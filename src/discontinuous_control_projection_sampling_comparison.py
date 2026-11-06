@@ -110,6 +110,13 @@ ROLLOUT_SEED_LABELS = {
     "bilevel_rollout": "bilevel seeds",
     "slacked_rollout": "slacked seeds",
 }
+SAMPLE_PANEL_TITLES = {
+    "uniform": "Uniform + MPC check",
+    "bilevel_projection": "Bilevel + projection",
+    "slacked_projection": "Slacked + projection",
+    "bilevel_rollout": "Bilevel + rollout",
+    "slacked_rollout": "Slacked + rollout",
+}
 # Width of the method-label column in the printed summaries, wide enough for
 # the longest label so a long one never desynchronizes the columns after it.
 LABEL_WIDTH = max(len(label) for label in LABELS.values())
@@ -1743,7 +1750,7 @@ def plot_samples(
     # A dedicated colorbar axis keeps the data axes equally sized; letting
     # fig.colorbar steal space from the last panel misaligns the shared axes.
     num_panels = len(results)
-    fig = plt.figure(figsize=(4.0 * num_panels + 1.2, 4.7), constrained_layout=True)
+    fig = plt.figure(figsize=(4.0 * num_panels + 1.2, 5.4), constrained_layout=True)
     grid = fig.add_gridspec(
         1,
         num_panels + 1,
@@ -1790,16 +1797,25 @@ def plot_samples(
                 edgecolors="none",
                 zorder=3,
             )
-        # ax.set_title(f"{LABELS[result.method]}\n$n={result.accepted}$")
+        ax.set_title(SAMPLE_PANEL_TITLES[result.method], fontsize=24)
         ax.set_xlim(-1.04 * bounds[0], 1.04 * bounds[0])
         ax.set_ylim(-1.04 * bounds[1], 1.04 * bounds[1])
-        ax.set_xlabel(r"$x_{0,1}$")
+        ax.set_xlabel(r"$x_{0,1}$", fontsize=26)
         ax.grid(alpha=0.25)
-    axes[0].set_ylabel(r"$x_{0,2}$")
+    axes[0].set_ylabel(r"$x_{0,2}$", fontsize=26)
+    legend_entries = {}
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(handles, labels, loc="best")
+        legend_entries.update(zip(labels, handles))
+    if legend_entries:
+        fig.legend(
+            legend_entries.values(),
+            legend_entries.keys(),
+            loc="outside lower center",
+            ncol=len(legend_entries),
+            fontsize=22,
+            borderaxespad=0.0,
+        )
 
     colorbar_mappable = matplotlib.cm.ScalarMappable(norm=normalization, cmap=colormap)
     colorbar_mappable.set_array([])

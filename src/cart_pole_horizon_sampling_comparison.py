@@ -109,6 +109,13 @@ MARKERS = {
     "bilevel_rollout": "D",
     "slacked_rollout": "v",
 }
+LINESTYLES = {
+    "uniform": "-",
+    "bilevel_projection": "--",
+    "slacked_projection": "-.",
+    "bilevel_rollout": ":",
+    "slacked_rollout": (0, (5, 2, 1, 2, 1, 2)),
+}
 # Width of the method-label column in the printed summaries, wide enough for
 # the longest label so a long one never desynchronizes the columns after it.
 LABEL_WIDTH = max(len(label) for label in LABELS.values())
@@ -1793,6 +1800,7 @@ def _draw_metric_vs_horizon(
             ys,
             yerr=errs if np.any(errs > 0) else None,
             marker=MARKERS[method],
+            linestyle=LINESTYLES[method],
             color=COLORS[method],
             capsize=3,
             linewidth=2.5,
@@ -1843,7 +1851,7 @@ def plot_acceptance_rate_vs_horizon(
             log_scale=False,
             fontsize=20,
         )
-        ax.legend(loc="best", fontsize=9)
+        ax.legend(loc="best", fontsize=14)
         # ax.set_title("Acceptance rate versus MPC horizon")
         fig.tight_layout()
         fig.savefig(output_dir / "acceptance_rate_vs_horizon.png", dpi=190)
@@ -1871,7 +1879,12 @@ def plot_total_time_vs_horizon(
             log_scale=True,
             fontsize=20,
         )
-        ax.legend(loc="best", fontsize=9)
+        ax.legend(
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.02),
+            ncol=2,
+            fontsize=14,
+        )
         # ax.set_title("Total computation time versus MPC horizon")
         fig.tight_layout()
         fig.savefig(output_dir / "total_time_vs_horizon.png", dpi=190)
